@@ -151,6 +151,16 @@ class MCPManager:
                 self._clients[name] = client
                 for tool in tools:
                     self._tool_registry[tool.name] = tool
+            except asyncio.CancelledError as exc:
+                self._clear_current_task_cancellation()
+                LOGGER.debug("Connection setup cancelled for MCP server '%s': %s", name, exc)
+                self._connected[name] = False
+                self._tools_by_server[name] = []
+                self._last_errors[name] = "Connection setup cancelled."
+                try:
+                    await client.__aexit__(None, None, None)
+                except Exception:  # noqa: BLE001
+                    pass
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Failed to connect MCP server '%s': %s", name, exc)
                 self._connected[name] = False
@@ -180,10 +190,18 @@ class MCPManager:
                 await client.__aexit__(None, None, None)
             except asyncio.CancelledError:
                 LOGGER.debug("MCP client close cancelled for '%s'; continuing cleanup", name)
+                self._clear_current_task_cancellation()
                 continue
             except Exception as exc:  # noqa: BLE001
                 LOGGER.debug("Error while closing MCP client '%s': %s", name, exc)
         self._clients = {}
+
+    def _clear_current_task_cancellation(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            return
+        while task.cancelling():
+            task.uncancel()
 
     def list_statuses(self) -> list[MCPServerStatus]:
         statuses: list[MCPServerStatus] = []

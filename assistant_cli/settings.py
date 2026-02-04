@@ -29,6 +29,7 @@ class AppSettings:
     llm_retry_backoff_seconds: float = 1.5
     tool_timeout_seconds: int = 45
     sqlite_path: Path = Path("data/assistant.db")
+    runtime_state_path: Path = Path("data/runtime_state.json")
     mcp_config_path: Path = Path("config/mcp_servers.json")
     mcp_fallback_config_path: Path = Path("config/mcp_servers.sample.json")
 
@@ -60,6 +61,9 @@ def load_settings() -> AppSettings:
     load_dotenv()
 
     sqlite_path = Path(os.getenv("ASSISTANT_SQLITE_PATH", "data/assistant.db")).expanduser()
+    runtime_state_path = Path(
+        os.getenv("ASSISTANT_RUNTIME_STATE_PATH", "data/runtime_state.json")
+    ).expanduser()
     mcp_config_path = Path(os.getenv("MCP_CONFIG_PATH", "config/mcp_servers.json")).expanduser()
 
     settings = AppSettings(
@@ -77,8 +81,10 @@ def load_settings() -> AppSettings:
         llm_retry_backoff_seconds=_get_float("LLM_RETRY_BACKOFF_SECONDS", 1.5),
         tool_timeout_seconds=_get_int("TOOL_TIMEOUT_SECONDS", 45),
         sqlite_path=sqlite_path,
+        runtime_state_path=runtime_state_path,
         mcp_config_path=mcp_config_path,
     )
 
     settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.runtime_state_path.parent.mkdir(parents=True, exist_ok=True)
     return settings

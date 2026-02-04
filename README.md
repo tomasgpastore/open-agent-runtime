@@ -159,6 +159,7 @@ Use `/paths` to manage directories exposed by the filesystem MCP server:
 - `/paths add <path>` adds a directory.
 - `/paths add downloads|desktop|documents` adds common macOS folders quickly.
 - `/paths remove <path>` removes a directory (at least one must remain).
+- Path changes are persisted to `config/mcp_servers.json`.
 
 ## LLM provider switching
 
@@ -167,6 +168,7 @@ Use `/llm` to inspect or switch providers at runtime:
 - `/llm local [model]` switches to local Ollama.
 - `/llm openai` lists available OpenAI models and prompts selection.
 - `/llm openai <model>` switches directly to a specific OpenAI model.
+- The selected provider/model is persisted to `data/runtime_state.json` and restored on restart.
 
 ## Terminal editing
 

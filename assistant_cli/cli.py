@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from typing import Callable, Sequence
@@ -132,7 +133,10 @@ class AssistantCLI:
             fallback_config_path=self.settings.mcp_fallback_config_path,
         )
 
-        llm_client = self._build_local_llm_client(model=self.settings.ollama_model)
+        persisted_selection = self._load_runtime_llm_selection()
+        if persisted_selection is not None:
+            self.current_provider, self.current_model = persisted_selection
+        llm_client = self._build_initial_llm_client()
 
         self.agent = LangGraphAgent(
             db_path=self.settings.sqlite_path,
@@ -142,6 +146,63 @@ class AssistantCLI:
             tool_timeout_seconds=self.settings.tool_timeout_seconds,
         )
         self._prompt_session = self._build_prompt_session()
+
+    def _build_initial_llm_client(self):
+        provider = self.current_provider
+        model = self.current_model
+        try:
+            if provider == "openai":
+                return self._build_openai_llm_client(model=model)
+            return self._build_local_llm_client(model=model)
+        except Exception as exc:  # noqa: BLE001
+            self.console.print(
+                f"Could not restore persisted LLM selection ({provider}/{model}): {exc}. "
+                f"Falling back to local ({self.settings.ollama_model}).",
+                style="yellow",
+            )
+            self.current_provider = "local"
+            self.current_model = self.settings.ollama_model
+            self._save_runtime_llm_selection()
+            return self._build_local_llm_client(model=self.current_model)
+
+    def _load_runtime_llm_selection(self) -> tuple[str, str] | None:
+        path = self.settings.runtime_state_path
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+
+        llm_data = payload.get("llm")
+        if not isinstance(llm_data, dict):
+            return None
+        provider = llm_data.get("provider")
+        model = llm_data.get("model")
+        if provider not in {"local", "openai"}:
+            return None
+        if not isinstance(model, str) or not model.strip():
+            return None
+        return provider, model.strip()
+
+    def _save_runtime_llm_selection(self) -> None:
+        path = self.settings.runtime_state_path
+        try:
+            if path.exists():
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    payload = {}
+            else:
+                payload = {}
+        except Exception:  # noqa: BLE001
+            payload = {}
+
+        payload["llm"] = {
+            "provider": self.current_provider,
+            "model": self.current_model,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
     def _build_prompt_session(self) -> PromptSession[str]:
         key_bindings = KeyBindings()
@@ -221,6 +282,7 @@ class AssistantCLI:
         self.agent.set_llm_client(client)
         self.current_provider = provider
         self.current_model = model
+        self._save_runtime_llm_selection()
 
         # Avoid cross-provider message-format mismatches (especially tool-call transcripts).
         if provider_changed:
@@ -249,7 +311,18 @@ class AssistantCLI:
                     continue
 
                 if user_input.startswith("/"):
-                    should_exit = await self._handle_command(user_input)
+                    try:
+                        should_exit = await self._handle_command(user_input)
+                    except asyncio.CancelledError:
+                        task = asyncio.current_task()
+                        if task is not None:
+                            while task.cancelling():
+                                task.uncancel()
+                        self.console.print(
+                            "Command was interrupted internally. You can continue.",
+                            style="yellow",
+                        )
+                        should_exit = False
                     if should_exit:
                         break
                     continue
@@ -391,15 +464,31 @@ class AssistantCLI:
         try:
             if action == "add":
                 added = self.mcp_manager.add_filesystem_allowed_directory(target_path)
-                self.console.print(f"Added filesystem allowed path: {added}", style="green")
+                self.console.print(
+                    f"Added filesystem allowed path: {added} (saved to MCP config).",
+                    style="green",
+                )
             else:
                 removed = self.mcp_manager.remove_filesystem_allowed_directory(target_path)
-                self.console.print(f"Removed filesystem allowed path: {removed}", style="green")
+                self.console.print(
+                    f"Removed filesystem allowed path: {removed} (saved to MCP config).",
+                    style="green",
+                )
         except Exception as exc:  # noqa: BLE001
             self.console.print(f"Failed to update allowed paths: {exc}", style="bold red")
             return
 
-        await self.mcp_manager.refresh_connections()
+        try:
+            await self.mcp_manager.refresh_connections()
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None:
+                while task.cancelling():
+                    task.uncancel()
+            self.console.print(
+                "MCP reconnect was interrupted; run /mcp refresh if needed.",
+                style="yellow",
+            )
         self._print_allowed_paths()
 
     def _resolve_directory_alias(self, raw: str) -> str:
