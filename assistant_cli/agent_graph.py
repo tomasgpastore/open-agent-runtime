@@ -18,7 +18,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
 from assistant_cli.approval import ApprovalManager
-from assistant_cli.llm_client import LLMCallError, OllamaLLMClient
+from assistant_cli.llm_client import LLMCallError, LLMToolUnsupportedError, OllamaLLMClient
 
 
 LOGGER = logging.getLogger(__name__)
@@ -193,6 +193,30 @@ class LangGraphAgent:
                             )
                         ],
                     }
+            return {
+                "messages": [response],
+                "iteration": iteration + 1,
+            }
+        except LLMToolUnsupportedError:
+            if needs_fresh_tool_call:
+                return {
+                    "stop_reason": "llm_tools_unsupported",
+                    "messages": [
+                        AIMessage(
+                            content=(
+                                f"The configured model '{self._llm_client.model_name}' does not support "
+                                "tool calling, so I can't verify live data with MCP tools. "
+                                "Please switch OLLAMA_MODEL to a tool-capable model and retry."
+                            )
+                        )
+                    ],
+                }
+            # Fall back to plain chat for non-tool turns.
+            response = await self._llm_client.invoke(
+                messages,
+                tools=None,
+                on_token=stream_callback,
+            )
             return {
                 "messages": [response],
                 "iteration": iteration + 1,

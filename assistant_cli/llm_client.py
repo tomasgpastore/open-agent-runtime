@@ -18,6 +18,10 @@ class LLMCallError(RuntimeError):
     """Raised when the LLM call fails after retries."""
 
 
+class LLMToolUnsupportedError(LLMCallError):
+    """Raised when the configured model does not support tool calling."""
+
+
 @dataclass(slots=True)
 class OllamaLLMConfig:
     base_url: str
@@ -34,6 +38,7 @@ class OllamaLLMClient:
 
     def __init__(self, config: OllamaLLMConfig) -> None:
         self._config = config
+        self._tool_support_known: bool | None = None
         self._base_model = ChatOllama(
             base_url=config.base_url,
             model=config.model,
@@ -42,12 +47,21 @@ class OllamaLLMClient:
             client_kwargs={"timeout": config.timeout_seconds},
         )
 
+    @property
+    def model_name(self) -> str:
+        return self._config.model
+
     async def invoke(
         self,
         messages: Sequence[BaseMessage],
         tools: Sequence[BaseTool] | None = None,
         on_token: Callable[[str], None] | None = None,
     ) -> AIMessage:
+        if tools and self._tool_support_known is False:
+            raise LLMToolUnsupportedError(
+                f"Model '{self._config.model}' does not support tool calling."
+            )
+
         model = self._base_model.bind_tools(tools) if tools else self._base_model
         last_error: Exception | None = None
 
@@ -65,8 +79,13 @@ class OllamaLLMClient:
                     raise LLMCallError(
                         f"Unexpected response type from LLM: {type(response).__name__}"
                     )
+                if tools:
+                    self._tool_support_known = True
                 return response
             except Exception as exc:  # noqa: BLE001
+                if tools and self._is_tool_unsupported_error(exc):
+                    self._tool_support_known = False
+                    raise LLMToolUnsupportedError(str(exc)) from exc
                 last_error = exc
                 if attempt >= self._config.retry_attempts:
                     break
@@ -132,3 +151,7 @@ class OllamaLLMClient:
                         parts.append(text)
             return "".join(parts)
         return ""
+
+    def _is_tool_unsupported_error(self, exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "does not support tools" in text or "tool calling is not supported" in text

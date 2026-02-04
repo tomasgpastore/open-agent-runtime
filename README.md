@@ -117,6 +117,9 @@ export ASSISTANT_SQLITE_PATH="data/assistant.db"
 export BRAVE_API_KEY="..."
 ```
 
+Note: some Ollama tags (including certain `llama3:8b` builds) do **not** support tool calling.
+If tool calls fail with `does not support tools`, switch to a tool-capable model tag on your server.
+
 ## Run
 
 ```bash
