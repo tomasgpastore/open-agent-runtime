@@ -102,7 +102,7 @@ If `/mcp` shows `connected=False`:
 
 ```bash
 export OLLAMA_BASE_URL="http://100.126.228.118:11434"
-export OLLAMA_MODEL="llama3:8b"
+export OLLAMA_MODEL="ministral-3:8b"
 
 # Optional tuning
 export OLLAMA_TEMPERATURE="0.1"

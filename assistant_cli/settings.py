@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 
 DEFAULT_OLLAMA_BASE_URL = "http://100.126.228.118:11434"
-DEFAULT_MODEL = "llama3:8b"
+DEFAULT_MODEL = "ministral-3:8b"
 
 
 @dataclass(slots=True)
