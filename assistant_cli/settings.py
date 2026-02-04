@@ -9,12 +9,16 @@ from dotenv import load_dotenv
 
 DEFAULT_OLLAMA_BASE_URL = "http://100.126.228.118:11434"
 DEFAULT_MODEL = "ministral-3:8b"
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 
 
 @dataclass(slots=True)
 class AppSettings:
     ollama_base_url: str = DEFAULT_OLLAMA_BASE_URL
     ollama_model: str = DEFAULT_MODEL
+    openai_base_url: str = DEFAULT_OPENAI_BASE_URL
+    openai_model: str = DEFAULT_OPENAI_MODEL
     ollama_temperature: float = 0.1
     model_context_window: int = 8000
     short_term_token_limit: int = 3000
@@ -61,6 +65,8 @@ def load_settings() -> AppSettings:
     settings = AppSettings(
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL),
         ollama_model=os.getenv("OLLAMA_MODEL", DEFAULT_MODEL),
+        openai_base_url=os.getenv("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
+        openai_model=os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
         ollama_temperature=_get_float("OLLAMA_TEMPERATURE", 0.1),
         model_context_window=_get_int("MODEL_CONTEXT_WINDOW", 8000),
         short_term_token_limit=_get_int("SHORT_TERM_TOKEN_LIMIT", 3000),

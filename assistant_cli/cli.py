@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Sequence
 
 from langchain_core.messages import BaseMessage, HumanMessage
 
 from assistant_cli.agent_graph import LangGraphAgent
 from assistant_cli.approval import ApprovalManager
-from assistant_cli.llm_client import OllamaLLMClient, OllamaLLMConfig
+from assistant_cli.llm_client import (
+    OpenAILLMClient,
+    OpenAILLMConfig,
+    OpenAIModelListError,
+    OllamaLLMClient,
+    OllamaLLMConfig,
+    list_openai_models,
+)
 from assistant_cli.logging_utils import configure_logging
 from assistant_cli.mcp_manager import MCPManager
 from assistant_cli.memory_store import SQLiteMemoryStore
@@ -53,6 +61,8 @@ class ResponseStreamPrinter:
 class AssistantCLI:
     def __init__(self) -> None:
         self.settings = load_settings()
+        self.current_provider = "local"
+        self.current_model = self.settings.ollama_model
 
         self.memory_store = SQLiteMemoryStore(
             db_path=self.settings.sqlite_path,
@@ -67,17 +77,7 @@ class AssistantCLI:
             fallback_config_path=self.settings.mcp_fallback_config_path,
         )
 
-        llm_client = OllamaLLMClient(
-            OllamaLLMConfig(
-                base_url=self.settings.ollama_base_url,
-                model=self.settings.ollama_model,
-                temperature=self.settings.ollama_temperature,
-                context_window=self.settings.model_context_window,
-                timeout_seconds=self.settings.llm_request_timeout_seconds,
-                retry_attempts=self.settings.llm_retry_attempts,
-                retry_backoff_seconds=self.settings.llm_retry_backoff_seconds,
-            )
-        )
+        llm_client = self._build_local_llm_client(model=self.settings.ollama_model)
 
         self.agent = LangGraphAgent(
             db_path=self.settings.sqlite_path,
@@ -86,6 +86,48 @@ class AssistantCLI:
             request_timeout_seconds=self.settings.request_timeout_seconds,
             tool_timeout_seconds=self.settings.tool_timeout_seconds,
         )
+
+    def _build_local_llm_client(self, model: str) -> OllamaLLMClient:
+        return OllamaLLMClient(
+            OllamaLLMConfig(
+                base_url=self.settings.ollama_base_url,
+                model=model,
+                temperature=self.settings.ollama_temperature,
+                context_window=self.settings.model_context_window,
+                timeout_seconds=self.settings.llm_request_timeout_seconds,
+                retry_attempts=self.settings.llm_retry_attempts,
+                retry_backoff_seconds=self.settings.llm_retry_backoff_seconds,
+            )
+        )
+
+    def _build_openai_llm_client(self, model: str) -> OpenAILLMClient:
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set.")
+
+        return OpenAILLMClient(
+            OpenAILLMConfig(
+                api_key=api_key,
+                model=model,
+                base_url=self.settings.openai_base_url,
+                temperature=self.settings.ollama_temperature,
+                timeout_seconds=self.settings.llm_request_timeout_seconds,
+                retry_attempts=self.settings.llm_retry_attempts,
+                retry_backoff_seconds=self.settings.llm_retry_backoff_seconds,
+            )
+        )
+
+    def _switch_provider(self, provider: str, model: str) -> None:
+        if provider == "local":
+            client = self._build_local_llm_client(model=model)
+        elif provider == "openai":
+            client = self._build_openai_llm_client(model=model)
+        else:
+            raise ValueError(f"Unsupported provider: {provider}")
+
+        self.agent.set_llm_client(client)
+        self.current_provider = provider
+        self.current_model = model
 
     async def run(self) -> None:
         await self.mcp_manager.refresh_connections()
@@ -171,6 +213,10 @@ class AssistantCLI:
 
         if command == "/memory":
             self._handle_memory_command()
+            return False
+
+        if command == "/llm":
+            await self._handle_llm_command(parts[1:])
             return False
 
         if command == "/new":
@@ -279,6 +325,94 @@ class AssistantCLI:
             f"{'yes' if stats.truncation_occurred_last_turn else 'no'}"
         )
 
+    async def _handle_llm_command(self, args: Sequence[str]) -> None:
+        if not args:
+            print(f"Current provider: {self.current_provider}")
+            print(f"Current model: {self.current_model}")
+            print("Usage: /llm local [model] | /llm openai [model]")
+            return
+
+        provider = args[0].lower()
+        if provider == "local":
+            model = args[1] if len(args) > 1 else self.settings.ollama_model
+            self._switch_provider(provider="local", model=model)
+            print(f"Switched LLM provider to local ({model}).")
+            return
+
+        if provider == "openai":
+            print(
+                "Note: OpenAI API uses API billing; a ChatGPT app subscription does not include API credits."
+            )
+            explicit_model = args[1] if len(args) > 1 else None
+            if explicit_model:
+                try:
+                    self._switch_provider(provider="openai", model=explicit_model)
+                except RuntimeError as exc:
+                    print(str(exc))
+                    return
+                print(f"Switched LLM provider to openai ({explicit_model}).")
+                return
+
+            api_key = os.getenv("OPENAI_API_KEY", "").strip()
+            if not api_key:
+                print("OPENAI_API_KEY is not set.")
+                return
+
+            try:
+                model_ids = await list_openai_models(
+                    api_key=api_key,
+                    base_url=self.settings.openai_base_url,
+                    timeout_seconds=self.settings.llm_request_timeout_seconds,
+                )
+            except OpenAIModelListError as exc:
+                print(str(exc))
+                return
+
+            if not model_ids:
+                print("No OpenAI models were returned for this API key.")
+                return
+
+            print("Available OpenAI models:")
+            max_display = 30
+            for index, model_name in enumerate(model_ids[:max_display], start=1):
+                print(f"{index}. {model_name}")
+            if len(model_ids) > max_display:
+                print(f"... and {len(model_ids) - max_display} more")
+
+            choice = await asyncio.to_thread(
+                input,
+                "Choose model by number or enter model id: ",
+            )
+            choice = choice.strip()
+            if not choice:
+                print("OpenAI model selection canceled.")
+                return
+
+            selected_model: str | None = None
+            if choice.isdigit():
+                index = int(choice)
+                if 1 <= index <= len(model_ids):
+                    selected_model = model_ids[index - 1]
+            else:
+                if choice in model_ids:
+                    selected_model = choice
+                else:
+                    selected_model = choice
+
+            if not selected_model:
+                print("Invalid selection.")
+                return
+
+            try:
+                self._switch_provider(provider="openai", model=selected_model)
+            except RuntimeError as exc:
+                print(str(exc))
+                return
+            print(f"Switched LLM provider to openai ({selected_model}).")
+            return
+
+        print("Usage: /llm local [model] | /llm openai [model]")
+
     async def _handle_new_command(self) -> None:
         self.memory_store.clear_session()
         print("Short-term memory cleared. Session restarted.")
@@ -305,7 +439,8 @@ class AssistantCLI:
 
     def _print_welcome(self) -> None:
         print("LangGraph MCP Assistant")
-        print(f"Model: {self.settings.ollama_model}")
+        print(f"Model: {self.current_model}")
+        print(f"LLM provider: {self.current_provider}")
         print(f"Ollama base URL: {self.settings.ollama_base_url}")
         print("Type /help for available commands.")
 
@@ -319,6 +454,8 @@ class AssistantCLI:
         print("- /approval global on|off")
         print("- /approval tool <tool_name> on|off")
         print("- /memory")
+        print("- /llm local [model]")
+        print("- /llm openai [model]")
         print("- /new")
         print("- /quit")
 

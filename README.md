@@ -13,6 +13,7 @@ Production-quality Python CLI personal assistant using:
   - `/mcp`
   - `/approval`
   - `/memory`
+  - `/llm`
   - `/new`
   - `/quit`
 - Dynamic MCP server enable/disable at runtime.
@@ -103,6 +104,9 @@ If `/mcp` shows `connected=False`:
 ```bash
 export OLLAMA_BASE_URL="http://100.126.228.118:11434"
 export OLLAMA_MODEL="ministral-3:8b"
+export OPENAI_BASE_URL="https://api.openai.com/v1"
+export OPENAI_MODEL="gpt-4o-mini"
+export OPENAI_API_KEY="..."
 
 # Optional tuning
 export OLLAMA_TEMPERATURE="0.1"
@@ -119,6 +123,7 @@ export BRAVE_API_KEY="..."
 
 Note: some Ollama tags (including certain `llama3:8b` builds) do **not** support tool calling.
 If tool calls fail with `does not support tools`, switch to a tool-capable model tag on your server.
+OpenAI usage requires API credentials and API billing. A ChatGPT app subscription does not include API credits.
 
 ## Run
 
@@ -140,6 +145,14 @@ Example server definitions include:
 Each server has `enabled` and transport settings. You can toggle at runtime:
 - `/mcp on <server>`
 - `/mcp off <server>`
+
+## LLM provider switching
+
+Use `/llm` to inspect or switch providers at runtime:
+- `/llm` shows current provider and model.
+- `/llm local [model]` switches to local Ollama.
+- `/llm openai` lists available OpenAI models and prompts selection.
+- `/llm openai <model>` switches directly to a specific OpenAI model.
 
 ## Short-term memory design
 

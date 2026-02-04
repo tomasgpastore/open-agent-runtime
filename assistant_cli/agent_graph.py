@@ -19,7 +19,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
 from assistant_cli.approval import ApprovalManager
-from assistant_cli.llm_client import LLMCallError, LLMToolUnsupportedError, OllamaLLMClient
+from assistant_cli.llm_client import LLMCallError, LLMClient, LLMToolUnsupportedError
 
 
 LOGGER = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ class LangGraphAgent:
     def __init__(
         self,
         db_path: Path,
-        llm_client: OllamaLLMClient,
+        llm_client: LLMClient,
         max_iterations: int,
         request_timeout_seconds: int,
         tool_timeout_seconds: int,
@@ -79,6 +79,9 @@ class LangGraphAgent:
         self._checkpointer_cm: AsyncSqliteSaver | None = None
         self._checkpointer: AsyncSqliteSaver | None = None
         self._graph = None
+
+    def set_llm_client(self, llm_client: LLMClient) -> None:
+        self._llm_client = llm_client
 
     async def _ensure_graph(self) -> None:
         if self._graph is not None:
