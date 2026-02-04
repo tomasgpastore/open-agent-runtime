@@ -3,9 +3,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Sequence
+from typing import Callable, Sequence
 
 from langchain_core.messages import BaseMessage, HumanMessage
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.patch_stdout import patch_stdout
 
 from assistant_cli.agent_graph import LangGraphAgent
 from assistant_cli.approval import ApprovalManager
@@ -25,6 +31,25 @@ from assistant_cli.settings import load_settings
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class SlashCommandCompleter(Completer):
+    def __init__(self, commands_provider: Callable[[], Sequence[str]]) -> None:
+        self._commands_provider = commands_provider
+
+    def get_completions(self, document, complete_event):  # type: ignore[override]
+        text_before_cursor = document.text_before_cursor
+        if not text_before_cursor.startswith("/"):
+            return
+        if " " in text_before_cursor or "\n" in text_before_cursor:
+            return
+
+        for command in sorted(set(self._commands_provider())):
+            if command.startswith(text_before_cursor):
+                yield Completion(
+                    command,
+                    start_position=-len(text_before_cursor),
+                )
 
 
 class ResponseStreamPrinter:
@@ -86,6 +111,39 @@ class AssistantCLI:
             request_timeout_seconds=self.settings.request_timeout_seconds,
             tool_timeout_seconds=self.settings.tool_timeout_seconds,
         )
+        self._prompt_session = self._build_prompt_session()
+
+    def _build_prompt_session(self) -> PromptSession[str]:
+        key_bindings = KeyBindings()
+
+        @key_bindings.add("enter")
+        def _(event) -> None:
+            event.current_buffer.validate_and_handle()
+
+        # Prefer Shift+Enter for newline. Some terminals don't distinguish it, so Ctrl+J is fallback.
+        @key_bindings.add("s-enter")
+        def _(event) -> None:
+            event.current_buffer.insert_text("\n")
+
+        @key_bindings.add("c-j")
+        def _(event) -> None:
+            event.current_buffer.insert_text("\n")
+
+        return PromptSession(
+            multiline=True,
+            completer=SlashCommandCompleter(self._available_commands),
+            complete_while_typing=True,
+            complete_in_thread=True,
+            key_bindings=key_bindings,
+            history=InMemoryHistory(),
+            prompt_continuation=lambda width, line_number, is_soft_wrap: "... ",
+        )
+
+    async def _prompt(self, prompt: str, multiline: bool = False) -> str:
+        return await self._prompt_session.prompt_async(
+            HTML(prompt),
+            multiline=multiline,
+        )
 
     def _build_local_llm_client(self, model: str) -> OllamaLLMClient:
         return OllamaLLMClient(
@@ -133,20 +191,27 @@ class AssistantCLI:
         await self.mcp_manager.refresh_connections()
         self._print_welcome()
 
-        while True:
-            raw = await asyncio.to_thread(input, "\nyou> ")
-            user_input = raw.strip()
-
-            if not user_input:
-                continue
-
-            if user_input.startswith("/"):
-                should_exit = await self._handle_command(user_input)
-                if should_exit:
+        with patch_stdout():
+            while True:
+                try:
+                    raw = await self._prompt("<ansicyan>you&gt; </ansicyan>", multiline=True)
+                except EOFError:
+                    print("Goodbye.")
                     break
-                continue
+                except KeyboardInterrupt:
+                    continue
 
-            await self._handle_user_message(user_input)
+                user_input = raw.strip()
+                if not user_input:
+                    continue
+
+                if user_input.startswith("/"):
+                    should_exit = await self._handle_command(user_input)
+                    if should_exit:
+                        break
+                    continue
+
+                await self._handle_user_message(user_input)
 
     async def aclose(self) -> None:
         await self.agent.aclose()
@@ -379,9 +444,9 @@ class AssistantCLI:
             if len(model_ids) > max_display:
                 print(f"... and {len(model_ids) - max_display} more")
 
-            choice = await asyncio.to_thread(
-                input,
-                "Choose model by number or enter model id: ",
+            choice = await self._prompt(
+                "<ansiblue>Choose model by number or enter model id: </ansiblue>",
+                multiline=False,
             )
             choice = choice.strip()
             if not choice:
@@ -417,9 +482,9 @@ class AssistantCLI:
         self.memory_store.clear_session()
         print("Short-term memory cleared. Session restarted.")
 
-        answer = await asyncio.to_thread(
-            input,
-            "Also clear long-term memory, yes or no? ",
+        answer = await self._prompt(
+            "<ansiblue>Also clear long-term memory, yes or no? </ansiblue>",
+            multiline=False,
         )
 
         if answer.strip().lower() not in {"yes", "y"}:
@@ -458,6 +523,21 @@ class AssistantCLI:
         print("- /llm openai [model]")
         print("- /new")
         print("- /quit")
+        print("Editor:")
+        print("- Enter sends")
+        print("- Shift+Enter inserts newline (Ctrl+J fallback)")
+        print("- Arrow keys navigate text/history; slash commands autocomplete")
+
+    def _available_commands(self) -> list[str]:
+        return [
+            "/mcp",
+            "/approval",
+            "/memory",
+            "/llm",
+            "/new",
+            "/quit",
+            "/help",
+        ]
 
     def _parse_on_off(self, value: str) -> bool | None:
         normalized = value.lower()

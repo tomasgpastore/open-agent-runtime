@@ -16,6 +16,10 @@ Production-quality Python CLI personal assistant using:
   - `/llm`
   - `/new`
   - `/quit`
+- Prompt-toolkit terminal UI:
+  - multiline compose
+  - slash command autocomplete/filtering
+  - line editing with arrow keys/history
 - Dynamic MCP server enable/disable at runtime.
 - Per-tool and global approval gates before tool execution.
 - Multi-step agent loop with up to 10 tool-iteration cycles by default.
@@ -153,6 +157,15 @@ Use `/llm` to inspect or switch providers at runtime:
 - `/llm local [model]` switches to local Ollama.
 - `/llm openai` lists available OpenAI models and prompts selection.
 - `/llm openai <model>` switches directly to a specific OpenAI model.
+
+## Terminal editing
+
+- `Enter` sends the message.
+- `Shift+Enter` inserts newline (with `Ctrl+J` fallback for terminals that don't distinguish Shift+Enter).
+- Arrow keys navigate text and history.
+- Typing `/` shows command completions, then filters as you keep typing.
+
+Note: advanced key combos like Shift+Arrow and Cmd+Arrow behavior depends on your terminal emulator and shell key mapping.
 
 ## Short-term memory design
 
