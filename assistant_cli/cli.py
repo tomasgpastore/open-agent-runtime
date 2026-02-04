@@ -125,8 +125,9 @@ class AssistantCLI:
         def _(event) -> None:
             event.current_buffer.validate_and_handle()
 
-        # Prefer Shift+Enter for newline. Some terminals don't distinguish it, so Ctrl+J is fallback.
-        @key_bindings.add("s-enter")
+        # Most terminals don't emit a distinct keycode for Shift+Enter.
+        # Provide robust newline fallbacks: Ctrl+J and Alt/Meta+Enter (escape+enter).
+        @key_bindings.add("escape", "enter")
         def _(event) -> None:
             event.current_buffer.insert_text("\n")
 
@@ -567,7 +568,7 @@ class AssistantCLI:
         self.console.print(table)
         self.console.print(
             Panel.fit(
-                "Enter sends\nShift+Enter inserts newline (Ctrl+J fallback)\n"
+                "Enter sends\nAlt+Enter or Ctrl+J inserts newline\n"
                 "Arrow keys navigate text/history\n"
                 "Typing / triggers command autocomplete",
                 title="Editor",

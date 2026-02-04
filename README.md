@@ -162,7 +162,7 @@ Use `/llm` to inspect or switch providers at runtime:
 ## Terminal editing
 
 - `Enter` sends the message.
-- `Shift+Enter` inserts newline (with `Ctrl+J` fallback for terminals that don't distinguish Shift+Enter).
+- `Alt+Enter` inserts newline (`Ctrl+J` fallback).
 - Arrow keys navigate text and history.
 - Typing `/` shows command completions, then filters as you keep typing.
 
