@@ -5,6 +5,7 @@ import json
 import logging
 import platform
 import uuid
+from copy import deepcopy
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -252,7 +253,8 @@ class LangGraphAgent:
 
         for call in tool_calls:
             tool_name = call["name"]
-            tool_args = call.get("args") or {}
+            raw_tool_args = call.get("args") or {}
+            tool_args = deepcopy(raw_tool_args)
             tool_call_id = call.get("id") or str(uuid.uuid4())
             if tool_event_callback:
                 try:
