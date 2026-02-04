@@ -162,11 +162,12 @@ Use `/llm` to inspect or switch providers at runtime:
 ## Terminal editing
 
 - `Enter` sends the message.
-- `Alt+Enter` inserts newline (`Ctrl+J` fallback).
+- `Shift+Enter` inserts newline when terminal sends a distinct sequence (also supports `Alt+Enter` and `Ctrl+J`).
 - Arrow keys navigate text and history.
+- `Shift+Arrow` extends selection in the input editor.
 - Typing `/` shows command completions, then filters as you keep typing.
 
-Note: advanced key combos like Shift+Arrow and Cmd+Arrow behavior depends on your terminal emulator and shell key mapping.
+Note: `Cmd+Arrow` usually does not reach terminal apps on macOS unless remapped by your terminal profile.
 
 ## Short-term memory design
 
