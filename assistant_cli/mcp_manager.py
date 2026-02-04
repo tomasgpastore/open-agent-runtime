@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
+from inspect import isawaitable
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,7 @@ class MCPServerStatus:
     enabled: bool
     connected: bool
     tools: list[str]
+    last_error: str | None = None
 
 
 class MCPManager:
@@ -63,6 +65,8 @@ class MCPManager:
         self._connected: dict[str, bool] = {name: False for name in self._servers}
         self._tools_by_server: dict[str, list[BaseTool]] = {name: [] for name in self._servers}
         self._tool_registry: dict[str, BaseTool] = {}
+        self._last_errors: dict[str, str | None] = {name: None for name in self._servers}
+        self._clients: dict[str, MultiServerMCPClient] = {}
 
     def _ensure_config_file(self) -> None:
         if self._config_path.exists():
@@ -126,9 +130,12 @@ class MCPManager:
             fh.write("\n")
 
     async def refresh_connections(self) -> None:
+        await self.aclose()
+        self._servers = self._load_server_configs()
         self._connected = {name: False for name in self._servers}
         self._tools_by_server = {name: [] for name in self._servers}
         self._tool_registry = {}
+        self._last_errors = {name: None for name in self._servers}
 
         for name, cfg in self._servers.items():
             if not cfg.enabled:
@@ -136,18 +143,43 @@ class MCPManager:
 
             client = MultiServerMCPClient({name: cfg.to_connection_dict()})
             try:
-                try:
-                    tools = await client.get_tools(tool_name_prefix=True)
-                except TypeError:
-                    tools = await client.get_tools()
+                await client.__aenter__()
+                tools = await self._load_tools_for_client(client)
                 self._connected[name] = True
                 self._tools_by_server[name] = tools
+                self._clients[name] = client
                 for tool in tools:
                     self._tool_registry[tool.name] = tool
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Failed to connect MCP server '%s': %s", name, exc)
                 self._connected[name] = False
                 self._tools_by_server[name] = []
+                self._last_errors[name] = str(exc)
+                try:
+                    await client.__aexit__(None, None, None)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    async def _load_tools_for_client(self, client: MultiServerMCPClient) -> list[BaseTool]:
+        try:
+            tools_or_awaitable = client.get_tools(tool_name_prefix=True)
+        except TypeError:
+            tools_or_awaitable = client.get_tools()
+
+        if isawaitable(tools_or_awaitable):
+            tools = await tools_or_awaitable
+        else:
+            tools = tools_or_awaitable
+
+        return list(tools)
+
+    async def aclose(self) -> None:
+        for name, client in list(self._clients.items()):
+            try:
+                await client.__aexit__(None, None, None)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("Error while closing MCP client '%s': %s", name, exc)
+        self._clients = {}
 
     def list_statuses(self) -> list[MCPServerStatus]:
         statuses: list[MCPServerStatus] = []
@@ -158,6 +190,7 @@ class MCPManager:
                     enabled=self._servers[name].enabled,
                     connected=self._connected.get(name, False),
                     tools=[tool.name for tool in self._tools_by_server.get(name, [])],
+                    last_error=self._last_errors.get(name),
                 )
             )
         return statuses

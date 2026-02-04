@@ -108,6 +108,7 @@ class AssistantCLI:
 
     async def aclose(self) -> None:
         await self.agent.aclose()
+        await self.mcp_manager.aclose()
 
     async def _handle_user_message(self, user_input: str) -> None:
         history = self.memory_store.load_messages()
@@ -214,6 +215,8 @@ class AssistantCLI:
             print(
                 f"- {status.name}: enabled={status.enabled} connected={status.connected}"
             )
+            if not status.connected and status.last_error:
+                print(f"  error: {status.last_error}")
             if not status.tools:
                 print("  tools: (none)")
                 continue
