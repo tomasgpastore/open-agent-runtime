@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -177,6 +178,9 @@ class MCPManager:
         for name, client in list(self._clients.items()):
             try:
                 await client.__aexit__(None, None, None)
+            except asyncio.CancelledError:
+                LOGGER.debug("MCP client close cancelled for '%s'; continuing cleanup", name)
+                continue
             except Exception as exc:  # noqa: BLE001
                 LOGGER.debug("Error while closing MCP client '%s': %s", name, exc)
         self._clients = {}

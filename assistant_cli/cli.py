@@ -114,7 +114,7 @@ class ResponseStreamPrinter:
 class AssistantCLI:
     def __init__(self) -> None:
         use_color = os.getenv("ASSISTANT_COLOR", "").lower() in {"1", "true", "yes", "on"}
-        self.console = Console(no_color=not use_color, highlight=False)
+        self.console = Console(no_color=not use_color, highlight=False, markup=False)
         self.settings = load_settings()
         self.current_provider = "local"
         self.current_model = self.settings.ollama_model
@@ -447,7 +447,7 @@ class AssistantCLI:
             table.add_row(
                 status.name,
                 "true" if status.enabled else "false",
-                "[green]true[/green]" if status.connected else "[red]false[/red]",
+                "true" if status.connected else "false",
                 tools_value,
                 status.last_error or "",
             )
@@ -640,10 +640,10 @@ class AssistantCLI:
 
     def _print_welcome(self) -> None:
         body = (
-            f"[bold]Model:[/bold] {self.current_model}\n"
-            f"[bold]LLM provider:[/bold] {self.current_provider}\n"
-            f"[bold]Ollama base URL:[/bold] {self.settings.ollama_base_url}\n"
-            "[bold]Tip:[/bold] Type /help for available commands."
+            f"Model: {self.current_model}\n"
+            f"LLM provider: {self.current_provider}\n"
+            f"Ollama base URL: {self.settings.ollama_base_url}\n"
+            "Tip: Type /help for available commands."
         )
         self.console.print(Panel.fit(body, title="LangGraph MCP Assistant", border_style="cyan"))
 
