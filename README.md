@@ -20,6 +20,7 @@ Production-quality Python CLI personal assistant using:
   - multiline compose
   - slash command autocomplete/filtering
   - line editing with arrow keys/history
+- Rich rendering for structured output (panels/tables/status views)
 - Dynamic MCP server enable/disable at runtime.
 - Per-tool and global approval gates before tool execution.
 - Multi-step agent loop with up to 10 tool-iteration cycles by default.

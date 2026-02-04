@@ -12,6 +12,9 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
 from assistant_cli.agent_graph import LangGraphAgent
 from assistant_cli.approval import ApprovalManager
@@ -53,7 +56,8 @@ class SlashCommandCompleter(Completer):
 
 
 class ResponseStreamPrinter:
-    def __init__(self) -> None:
+    def __init__(self, console: Console) -> None:
+        self._console = console
         self._line_open = False
         self._saw_token = False
 
@@ -61,14 +65,14 @@ class ResponseStreamPrinter:
         if not token:
             return
         if not self._line_open:
-            print("assistant> ", end="", flush=True)
+            self._console.print("assistant> ", style="bold cyan", end="")
             self._line_open = True
-        print(token, end="", flush=True)
+        self._console.print(token, end="", markup=False, highlight=False, soft_wrap=True)
         self._saw_token = True
 
     def on_tool(self, tool_name: str) -> None:
         self._close_line_if_needed()
-        print(f"tool> {tool_name}")
+        self._console.print(f"tool> {tool_name}", style="bold magenta")
 
     def finish(self) -> None:
         self._close_line_if_needed()
@@ -79,12 +83,13 @@ class ResponseStreamPrinter:
 
     def _close_line_if_needed(self) -> None:
         if self._line_open:
-            print()
+            self._console.print()
             self._line_open = False
 
 
 class AssistantCLI:
     def __init__(self) -> None:
+        self.console = Console()
         self.settings = load_settings()
         self.current_provider = "local"
         self.current_model = self.settings.ollama_model
@@ -196,7 +201,7 @@ class AssistantCLI:
                 try:
                     raw = await self._prompt("<ansicyan>you&gt; </ansicyan>", multiline=True)
                 except EOFError:
-                    print("Goodbye.")
+                    self.console.print("Goodbye.", style="bold green")
                     break
                 except KeyboardInterrupt:
                     continue
@@ -222,7 +227,7 @@ class AssistantCLI:
         initial_messages, pre_truncation = self.memory_store.enforce_token_limit(
             [*history, HumanMessage(content=user_input)]
         )
-        streamer = ResponseStreamPrinter()
+        streamer = ResponseStreamPrinter(self.console)
 
         tool_map = {tool.name: tool for tool in self.mcp_manager.active_tools()}
 
@@ -236,13 +241,13 @@ class AssistantCLI:
             )
         except TimeoutError:
             streamer.finish()
-            print("Assistant request timed out.")
+            self.console.print("Assistant request timed out.", style="bold red")
             self.memory_store.save_messages(initial_messages, truncation_occurred=pre_truncation)
             return
         except Exception as exc:  # noqa: BLE001
             streamer.finish()
             LOGGER.exception("Agent run failed")
-            print(f"Assistant error: {exc}")
+            self.console.print(f"Assistant error: {exc}", style="bold red")
             self.memory_store.save_messages(initial_messages, truncation_occurred=pre_truncation)
             return
 
@@ -258,14 +263,15 @@ class AssistantCLI:
 
         streamer.finish()
         if not streamer.saw_token:
-            print(f"assistant> {result.final_answer}")
+            self.console.print("assistant> ", style="bold cyan", end="")
+            self.console.print(result.final_answer, markup=False, highlight=False)
 
     async def _handle_command(self, command_line: str) -> bool:
         parts = command_line.strip().split()
         command = parts[0].lower()
 
         if command == "/quit":
-            print("Goodbye.")
+            self.console.print("Goodbye.", style="bold green")
             return True
 
         if command == "/mcp":
@@ -292,7 +298,7 @@ class AssistantCLI:
             self._print_help()
             return False
 
-        print("Unknown command. Use /help for available commands.")
+        self.console.print("Unknown command. Use /help for available commands.", style="yellow")
         return False
 
     async def _handle_mcp_command(self, args: Sequence[str]) -> None:
@@ -308,33 +314,46 @@ class AssistantCLI:
         if len(args) == 2 and args[0].lower() in {"on", "off"}:
             server_name = args[1]
             if not self.mcp_manager.is_server_known(server_name):
-                print(f"Unknown MCP server '{server_name}'.")
+                self.console.print(f"Unknown MCP server '{server_name}'.", style="yellow")
                 return
 
             enabled = args[0].lower() == "on"
             self.mcp_manager.set_server_enabled(server_name, enabled)
             await self.mcp_manager.refresh_connections()
-            print(f"MCP server '{server_name}' set to {'enabled' if enabled else 'disabled'}.")
+            self.console.print(
+                f"MCP server '{server_name}' set to {'enabled' if enabled else 'disabled'}.",
+                style="green" if enabled else "yellow",
+            )
             self._print_mcp_status()
             return
 
-        print("Usage: /mcp | /mcp refresh | /mcp on <server> | /mcp off <server>")
+        self.console.print("Usage: /mcp | /mcp refresh | /mcp on <server> | /mcp off <server>", style="yellow")
 
     def _print_mcp_status(self) -> None:
-        print("\nMCP servers:")
+        table = Table(title="MCP Servers", show_lines=True)
+        table.add_column("Server", style="bold")
+        table.add_column("Enabled")
+        table.add_column("Connected")
+        table.add_column("Tools")
+        table.add_column("Error")
         for status in self.mcp_manager.list_statuses():
-            print(
-                f"- {status.name}: enabled={status.enabled} connected={status.connected}"
+            if status.tools:
+                tool_lines = []
+                for tool_name in status.tools:
+                    approval = "yes" if self.approval_manager.tool_enabled(tool_name) else "no"
+                    tool_lines.append(f"{tool_name} (approval: {approval})")
+                tools_value = "\n".join(tool_lines)
+            else:
+                tools_value = "(none)"
+            table.add_row(
+                status.name,
+                "true" if status.enabled else "false",
+                "[green]true[/green]" if status.connected else "[red]false[/red]",
+                tools_value,
+                status.last_error or "",
             )
-            if not status.connected and status.last_error:
-                print(f"  error: {status.last_error}")
-            if not status.tools:
-                print("  tools: (none)")
-                continue
-
-            for tool_name in status.tools:
-                approval = "yes" if self.approval_manager.tool_enabled(tool_name) else "no"
-                print(f"  - {tool_name} (approval required: {approval})")
+        self.console.print()
+        self.console.print(table)
 
     def _handle_approval_command(self, args: Sequence[str]) -> None:
         if not args:
@@ -344,83 +363,98 @@ class AssistantCLI:
         if len(args) == 2 and args[0].lower() == "global":
             enabled = self._parse_on_off(args[1])
             if enabled is None:
-                print("Usage: /approval global on|off")
+                self.console.print("Usage: /approval global on|off", style="yellow")
                 return
             self.approval_manager.set_global(enabled)
-            print(f"Global approval {'enabled' if enabled else 'disabled'}.")
+            self.console.print(
+                f"Global approval {'enabled' if enabled else 'disabled'}.",
+                style="green" if enabled else "yellow",
+            )
             return
 
         if len(args) == 3 and args[0].lower() == "tool":
             tool_name = args[1]
             enabled = self._parse_on_off(args[2])
             if enabled is None:
-                print("Usage: /approval tool <tool_name> on|off")
+                self.console.print("Usage: /approval tool <tool_name> on|off", style="yellow")
                 return
 
             self.approval_manager.set_tool(tool_name, enabled)
-            print(
-                f"Approval for '{tool_name}' {'enabled' if enabled else 'disabled'}."
+            self.console.print(
+                f"Approval for '{tool_name}' {'enabled' if enabled else 'disabled'}.",
+                style="green" if enabled else "yellow",
             )
             return
 
-        print("Usage: /approval | /approval global on|off | /approval tool <name> on|off")
+        self.console.print(
+            "Usage: /approval | /approval global on|off | /approval tool <name> on|off",
+            style="yellow",
+        )
 
     def _print_approval_status(self) -> None:
-        print(f"Global approval: {'enabled' if self.approval_manager.global_enabled() else 'disabled'}")
+        self.console.print(
+            f"Global approval: {'enabled' if self.approval_manager.global_enabled() else 'disabled'}",
+            style="bold",
+        )
         all_tool_names = sorted(self.mcp_manager.tool_names())
         if not all_tool_names:
-            print("Tool-specific approvals: none (no active tools).")
+            self.console.print("Tool-specific approvals: none (no active tools).", style="dim")
             return
 
-        print("Tool-specific approvals:")
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("Tool")
+        table.add_column("Approval required")
         for status in self.approval_manager.list_statuses(all_tool_names):
-            print(
-                f"- {status.tool_name}: {'required' if status.approval_required else 'not required'}"
+            table.add_row(
+                status.tool_name,
+                "required" if status.approval_required else "not required",
             )
+        self.console.print(table)
 
     def _handle_memory_command(self) -> None:
         stats = self.memory_store.stats()
-        print("Short-term memory status:")
-        print(f"- Estimated tokens in memory: {stats.estimated_tokens}")
-        print(f"- Rolling memory limit: {stats.token_limit}")
-        print(f"- Model context window target: {stats.context_window_target}")
-        print(f"- Recent turns kept: {stats.recent_turns_kept}")
-        print(
-            "- Truncation occurred last turn: "
-            f"{'yes' if stats.truncation_occurred_last_turn else 'no'}"
+        body = (
+            f"Estimated tokens in memory: {stats.estimated_tokens}\n"
+            f"Rolling memory limit: {stats.token_limit}\n"
+            f"Model context window target: {stats.context_window_target}\n"
+            f"Recent turns kept: {stats.recent_turns_kept}\n"
+            f"Truncation occurred last turn: {'yes' if stats.truncation_occurred_last_turn else 'no'}"
         )
+        self.console.print(Panel.fit(body, title="Short-term Memory", border_style="blue"))
 
     async def _handle_llm_command(self, args: Sequence[str]) -> None:
         if not args:
-            print(f"Current provider: {self.current_provider}")
-            print(f"Current model: {self.current_model}")
-            print("Usage: /llm local [model] | /llm openai [model]")
+            self.console.print(f"Current provider: {self.current_provider}", style="bold")
+            self.console.print(f"Current model: {self.current_model}", style="bold")
+            self.console.print("Usage: /llm local [model] | /llm openai [model]", style="yellow")
             return
 
         provider = args[0].lower()
         if provider == "local":
             model = args[1] if len(args) > 1 else self.settings.ollama_model
             self._switch_provider(provider="local", model=model)
-            print(f"Switched LLM provider to local ({model}).")
+            self.console.print(f"Switched LLM provider to local ({model}).", style="green")
             return
 
         if provider == "openai":
-            print(
+            self.console.print(
                 "Note: OpenAI API uses API billing; a ChatGPT app subscription does not include API credits."
+                ,
+                style="yellow",
             )
             explicit_model = args[1] if len(args) > 1 else None
             if explicit_model:
                 try:
                     self._switch_provider(provider="openai", model=explicit_model)
                 except RuntimeError as exc:
-                    print(str(exc))
+                    self.console.print(str(exc), style="bold red")
                     return
-                print(f"Switched LLM provider to openai ({explicit_model}).")
+                self.console.print(f"Switched LLM provider to openai ({explicit_model}).", style="green")
                 return
 
             api_key = os.getenv("OPENAI_API_KEY", "").strip()
             if not api_key:
-                print("OPENAI_API_KEY is not set.")
+                self.console.print("OPENAI_API_KEY is not set.", style="bold red")
                 return
 
             try:
@@ -430,19 +464,22 @@ class AssistantCLI:
                     timeout_seconds=self.settings.llm_request_timeout_seconds,
                 )
             except OpenAIModelListError as exc:
-                print(str(exc))
+                self.console.print(str(exc), style="bold red")
                 return
 
             if not model_ids:
-                print("No OpenAI models were returned for this API key.")
+                self.console.print("No OpenAI models were returned for this API key.", style="yellow")
                 return
 
-            print("Available OpenAI models:")
             max_display = 30
+            table = Table(title="Available OpenAI Models")
+            table.add_column("#", justify="right")
+            table.add_column("Model")
             for index, model_name in enumerate(model_ids[:max_display], start=1):
-                print(f"{index}. {model_name}")
+                table.add_row(str(index), model_name)
+            self.console.print(table)
             if len(model_ids) > max_display:
-                print(f"... and {len(model_ids) - max_display} more")
+                self.console.print(f"... and {len(model_ids) - max_display} more", style="dim")
 
             choice = await self._prompt(
                 "<ansiblue>Choose model by number or enter model id: </ansiblue>",
@@ -450,7 +487,7 @@ class AssistantCLI:
             )
             choice = choice.strip()
             if not choice:
-                print("OpenAI model selection canceled.")
+                self.console.print("OpenAI model selection canceled.", style="yellow")
                 return
 
             selected_model: str | None = None
@@ -465,22 +502,22 @@ class AssistantCLI:
                     selected_model = choice
 
             if not selected_model:
-                print("Invalid selection.")
+                self.console.print("Invalid selection.", style="yellow")
                 return
 
             try:
                 self._switch_provider(provider="openai", model=selected_model)
             except RuntimeError as exc:
-                print(str(exc))
+                self.console.print(str(exc), style="bold red")
                 return
-            print(f"Switched LLM provider to openai ({selected_model}).")
+            self.console.print(f"Switched LLM provider to openai ({selected_model}).", style="green")
             return
 
-        print("Usage: /llm local [model] | /llm openai [model]")
+        self.console.print("Usage: /llm local [model] | /llm openai [model]", style="yellow")
 
     async def _handle_new_command(self) -> None:
         self.memory_store.clear_session()
-        print("Short-term memory cleared. Session restarted.")
+        self.console.print("Short-term memory cleared. Session restarted.", style="green")
 
         answer = await self._prompt(
             "<ansiblue>Also clear long-term memory, yes or no? </ansiblue>",
@@ -488,45 +525,55 @@ class AssistantCLI:
         )
 
         if answer.strip().lower() not in {"yes", "y"}:
-            print("Kept long-term memory.")
+            self.console.print("Kept long-term memory.", style="dim")
             return
 
         await self.mcp_manager.refresh_connections()
         tools = {tool.name: tool for tool in self.mcp_manager.active_tools()}
         try:
             success, message = await wipe_memory_graph(tools)
-            print(message)
+            self.console.print(message, style="green" if success else "yellow")
             if not success:
-                print("Long-term memory wipe was not completed.")
+                self.console.print("Long-term memory wipe was not completed.", style="yellow")
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("Failed to wipe long-term memory")
-            print(f"Failed to wipe long-term memory: {exc}")
+            self.console.print(f"Failed to wipe long-term memory: {exc}", style="bold red")
 
     def _print_welcome(self) -> None:
-        print("LangGraph MCP Assistant")
-        print(f"Model: {self.current_model}")
-        print(f"LLM provider: {self.current_provider}")
-        print(f"Ollama base URL: {self.settings.ollama_base_url}")
-        print("Type /help for available commands.")
+        body = (
+            f"[bold]Model:[/bold] {self.current_model}\n"
+            f"[bold]LLM provider:[/bold] {self.current_provider}\n"
+            f"[bold]Ollama base URL:[/bold] {self.settings.ollama_base_url}\n"
+            "[bold]Tip:[/bold] Type /help for available commands."
+        )
+        self.console.print(Panel.fit(body, title="LangGraph MCP Assistant", border_style="cyan"))
 
     def _print_help(self) -> None:
-        print("Commands:")
-        print("- /mcp")
-        print("- /mcp refresh")
-        print("- /mcp on <server>")
-        print("- /mcp off <server>")
-        print("- /approval")
-        print("- /approval global on|off")
-        print("- /approval tool <tool_name> on|off")
-        print("- /memory")
-        print("- /llm local [model]")
-        print("- /llm openai [model]")
-        print("- /new")
-        print("- /quit")
-        print("Editor:")
-        print("- Enter sends")
-        print("- Shift+Enter inserts newline (Ctrl+J fallback)")
-        print("- Arrow keys navigate text/history; slash commands autocomplete")
+        table = Table(title="Commands")
+        table.add_column("Command", style="bold")
+        table.add_column("Description")
+        table.add_row("/mcp", "Show MCP status")
+        table.add_row("/mcp refresh", "Reconnect MCP servers")
+        table.add_row("/mcp on <server>", "Enable one MCP server")
+        table.add_row("/mcp off <server>", "Disable one MCP server")
+        table.add_row("/approval", "Show approval settings")
+        table.add_row("/approval global on|off", "Toggle global approval")
+        table.add_row("/approval tool <tool> on|off", "Toggle approval for one tool")
+        table.add_row("/memory", "Show short-term memory stats")
+        table.add_row("/llm local [model]", "Switch to local Ollama model")
+        table.add_row("/llm openai [model]", "Switch to OpenAI model")
+        table.add_row("/new", "Reset short-term memory")
+        table.add_row("/quit", "Exit")
+        self.console.print(table)
+        self.console.print(
+            Panel.fit(
+                "Enter sends\nShift+Enter inserts newline (Ctrl+J fallback)\n"
+                "Arrow keys navigate text/history\n"
+                "Typing / triggers command autocomplete",
+                title="Editor",
+                border_style="blue",
+            )
+        )
 
     def _available_commands(self) -> list[str]:
         return [
@@ -555,6 +602,6 @@ def run() -> None:
     try:
         asyncio.run(app.run())
     except KeyboardInterrupt:
-        print("\nInterrupted. Goodbye.")
+        app.console.print("\nInterrupted. Goodbye.", style="bold yellow")
     finally:
         asyncio.run(app.aclose())
