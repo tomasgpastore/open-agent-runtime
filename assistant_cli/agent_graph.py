@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Callable, TypedDict
 
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -37,6 +37,14 @@ def _build_system_prompt() -> str:
         "Return concise final answers and never expose hidden reasoning. "
         f"Runtime context: current_time={now}; os={os_info}."
     )
+
+
+TOOL_RETRY_SYSTEM_PROMPT = (
+    "Policy correction: the previous draft did not satisfy grounding rules. "
+    "For requests asking for web search, live/current data, weather-now checks, or explicit rechecks, "
+    "you MUST call at least one relevant external tool before answering. "
+    "If no relevant tool is available, explicitly say you cannot verify live data."
+)
 
 
 class AgentState(TypedDict):
@@ -128,10 +136,31 @@ class LangGraphAgent:
             }
 
         tools = list(config["configurable"]["tools"].values())
+        tool_names = [tool.name for tool in tools]
+        requires_tool = self._requires_external_tool(state["messages"])
+        needs_fresh_tool_call = requires_tool and not self._has_tool_message_since_latest_user(
+            state["messages"]
+        )
         stream_callback: Callable[[str], None] | None = config["configurable"].get(
             "stream_callback"
         )
+        # Do not stream drafts for turns that must be grounded via tool use.
+        if needs_fresh_tool_call:
+            stream_callback = None
         messages = [SystemMessage(content=_build_system_prompt()), *state["messages"]]
+
+        if needs_fresh_tool_call and not self._has_relevant_external_tool(tool_names):
+            return {
+                "stop_reason": "tool_unavailable",
+                "messages": [
+                    AIMessage(
+                        content=(
+                            "I can't verify that reliably because no web/fetch tool is connected. "
+                            "Use /mcp to enable a web-capable MCP server, then ask again."
+                        )
+                    )
+                ],
+            }
 
         try:
             response = await self._llm_client.invoke(
@@ -139,6 +168,31 @@ class LangGraphAgent:
                 tools=tools,
                 on_token=stream_callback,
             )
+            if needs_fresh_tool_call and not response.tool_calls:
+                retry_messages = [
+                    SystemMessage(content=TOOL_RETRY_SYSTEM_PROMPT),
+                    *messages,
+                    response,
+                    HumanMessage(content="Policy check: call a relevant tool now."),
+                ]
+                response = await self._llm_client.invoke(
+                    retry_messages,
+                    tools=tools,
+                    on_token=None,
+                )
+                if not response.tool_calls:
+                    return {
+                        "stop_reason": "tool_required_no_call",
+                        "messages": [
+                            AIMessage(
+                                content=(
+                                    "I need to call a web/fetch tool to answer that reliably, "
+                                    "and I couldn't produce a valid grounded tool call. "
+                                    "Please retry or check /mcp tool availability."
+                                )
+                            )
+                        ],
+                    }
             return {
                 "messages": [response],
                 "iteration": iteration + 1,
@@ -313,3 +367,49 @@ class LangGraphAgent:
                     return content
                 return str(content)
         return "I could not produce a final answer."
+
+    def _requires_external_tool(self, messages: list[BaseMessage]) -> bool:
+        latest_user = self._latest_user_message_text(messages)
+        if not latest_user:
+            return False
+
+        text = latest_user.lower()
+        explicit_web = any(
+            phrase in text
+            for phrase in (
+                "search the web",
+                "search web",
+                "look it up online",
+                "browse the web",
+                "web search",
+                "please recheck",
+                "recheck that",
+            )
+        )
+        live_weather = (
+            any(word in text for word in ("weather", "temperature", "forecast"))
+            and any(word in text for word in ("now", "current", "right now", "today", "latest"))
+        )
+        return explicit_web or live_weather
+
+    def _latest_user_message_text(self, messages: list[BaseMessage]) -> str:
+        for message in reversed(messages):
+            if isinstance(message, HumanMessage):
+                if isinstance(message.content, str):
+                    return message.content
+                return str(message.content)
+        return ""
+
+    def _has_relevant_external_tool(self, tool_names: list[str]) -> bool:
+        return any(
+            any(marker in name.lower() for marker in ("web", "search", "fetch", "http"))
+            for name in tool_names
+        )
+
+    def _has_tool_message_since_latest_user(self, messages: list[BaseMessage]) -> bool:
+        for message in reversed(messages):
+            if isinstance(message, HumanMessage):
+                break
+            if isinstance(message, ToolMessage):
+                return True
+        return False
