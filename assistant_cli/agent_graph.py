@@ -226,7 +226,7 @@ class LangGraphAgent:
                 "iteration": iteration + 1,
             }
         except LLMCallError as exc:
-            LOGGER.exception("LLM call failed")
+            LOGGER.error("LLM call failed: %s", exc)
             return {
                 "stop_reason": "llm_error",
                 "messages": [
@@ -263,7 +263,7 @@ class LangGraphAgent:
                 try:
                     tool_event_callback(tool_name)
                 except Exception:  # noqa: BLE001
-                    LOGGER.exception("Tool event callback failed")
+                    LOGGER.debug("Tool event callback failed", exc_info=True)
 
             tool = tools.get(tool_name)
             if tool is None:
@@ -304,7 +304,7 @@ class LangGraphAgent:
                     )
                 )
             except Exception as exc:  # noqa: BLE001
-                LOGGER.exception("Tool call failed: %s", tool_name)
+                LOGGER.error("Tool call failed: %s (%s)", tool_name, exc)
                 tool_messages.append(
                     ToolMessage(
                         tool_call_id=tool_call_id,

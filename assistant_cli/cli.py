@@ -38,17 +38,17 @@ LOGGER = logging.getLogger(__name__)
 
 
 class SlashCommandCompleter(Completer):
-    def __init__(self, commands_provider: Callable[[], Sequence[str]]) -> None:
-        self._commands_provider = commands_provider
+    def __init__(self, suggestions_provider: Callable[[], Sequence[str]]) -> None:
+        self._suggestions_provider = suggestions_provider
 
     def get_completions(self, document, complete_event):  # type: ignore[override]
         text_before_cursor = document.text_before_cursor
         if not text_before_cursor.startswith("/"):
             return
-        if " " in text_before_cursor or "\n" in text_before_cursor:
+        if "\n" in text_before_cursor:
             return
 
-        for command in sorted(set(self._commands_provider())):
+        for command in sorted(set(self._suggestions_provider())):
             if command.startswith(text_before_cursor):
                 yield Completion(
                     command,
@@ -90,7 +90,8 @@ class ResponseStreamPrinter:
 
 class AssistantCLI:
     def __init__(self) -> None:
-        self.console = Console()
+        use_color = os.getenv("ASSISTANT_COLOR", "").lower() in {"1", "true", "yes", "on"}
+        self.console = Console(no_color=not use_color, highlight=False)
         self.settings = load_settings()
         self.current_provider = "local"
         self.current_model = self.settings.ollama_model
@@ -181,7 +182,7 @@ class AssistantCLI:
 
         return PromptSession(
             multiline=True,
-            completer=SlashCommandCompleter(self._available_commands),
+            completer=SlashCommandCompleter(self._command_suggestions),
             complete_while_typing=True,
             complete_in_thread=True,
             key_bindings=key_bindings,
@@ -226,6 +227,7 @@ class AssistantCLI:
         )
 
     def _switch_provider(self, provider: str, model: str) -> None:
+        provider_changed = self.current_provider != provider
         if provider == "local":
             client = self._build_local_llm_client(model=model)
         elif provider == "openai":
@@ -236,6 +238,14 @@ class AssistantCLI:
         self.agent.set_llm_client(client)
         self.current_provider = provider
         self.current_model = model
+
+        # Avoid cross-provider message-format mismatches (especially tool-call transcripts).
+        if provider_changed:
+            self.memory_store.clear_session()
+            self.console.print(
+                "Short-term session history was reset after provider switch.",
+                style="dim",
+            )
 
     async def run(self) -> None:
         await self.mcp_manager.refresh_connections()
@@ -291,7 +301,7 @@ class AssistantCLI:
             return
         except Exception as exc:  # noqa: BLE001
             streamer.finish()
-            LOGGER.exception("Agent run failed")
+            LOGGER.error("Agent run failed: %s", exc)
             self.console.print(f"Assistant error: {exc}", style="bold red")
             self.memory_store.save_messages(initial_messages, truncation_occurred=pre_truncation)
             return
@@ -581,7 +591,7 @@ class AssistantCLI:
             if not success:
                 self.console.print("Long-term memory wipe was not completed.", style="yellow")
         except Exception as exc:  # noqa: BLE001
-            LOGGER.exception("Failed to wipe long-term memory")
+            LOGGER.error("Failed to wipe long-term memory: %s", exc)
             self.console.print(f"Failed to wipe long-term memory: {exc}", style="bold red")
 
     def _print_welcome(self) -> None:
@@ -621,12 +631,21 @@ class AssistantCLI:
             )
         )
 
-    def _available_commands(self) -> list[str]:
+    def _command_suggestions(self) -> list[str]:
         return [
             "/mcp",
+            "/mcp refresh",
+            "/mcp on ",
+            "/mcp off ",
             "/approval",
+            "/approval global on",
+            "/approval global off",
+            "/approval tool ",
             "/memory",
             "/llm",
+            "/llm local ",
+            "/llm openai",
+            "/llm openai ",
             "/new",
             "/quit",
             "/help",

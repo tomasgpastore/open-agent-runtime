@@ -7,7 +7,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from langchain_core.messages import BaseMessage, HumanMessage, messages_from_dict, messages_to_dict
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    ToolMessage,
+    messages_from_dict,
+    messages_to_dict,
+)
 
 
 @dataclass(slots=True)
@@ -59,10 +66,11 @@ class SQLiteMemoryStore:
             return []
 
         data = json.loads(row["messages_json"])
-        return list(messages_from_dict(data))
+        return self._normalize_messages(list(messages_from_dict(data)))
 
     def save_messages(self, messages: Sequence[BaseMessage], truncation_occurred: bool) -> None:
-        serialized = json.dumps(messages_to_dict(list(messages)))
+        normalized = self._normalize_messages(list(messages))
+        serialized = json.dumps(messages_to_dict(normalized))
         with self._connect() as conn:
             conn.execute(
                 """
@@ -83,13 +91,18 @@ class SQLiteMemoryStore:
             conn.commit()
 
     def enforce_token_limit(self, messages: Sequence[BaseMessage]) -> tuple[list[BaseMessage], bool]:
-        working = list(messages)
-        truncated = False
+        input_messages = list(messages)
+        working = self._normalize_messages(input_messages)
+        truncated = len(working) != len(input_messages)
 
         # Keep at least the most recent message so the current user turn is never dropped.
         while len(working) > 1 and self.estimate_tokens(working) > self._token_limit:
             working.pop(0)
             truncated = True
+            normalized = self._normalize_messages(working)
+            if len(normalized) != len(working):
+                truncated = True
+            working = normalized
 
         return working, truncated
 
@@ -123,3 +136,48 @@ class SQLiteMemoryStore:
             recent_turns_kept=turns,
             truncation_occurred_last_turn=truncation_flag,
         )
+
+    def _normalize_messages(self, messages: list[BaseMessage]) -> list[BaseMessage]:
+        normalized: list[BaseMessage] = []
+        index = 0
+
+        while index < len(messages):
+            current = messages[index]
+
+            if isinstance(current, ToolMessage):
+                # Skip orphaned tool messages.
+                index += 1
+                continue
+
+            if isinstance(current, AIMessage) and current.tool_calls:
+                requested_ids = {
+                    call.get("id")
+                    for call in current.tool_calls
+                    if isinstance(call, dict) and call.get("id")
+                }
+                if not requested_ids:
+                    index += 1
+                    continue
+
+                j = index + 1
+                collected_tools: list[ToolMessage] = []
+                collected_ids: set[str] = set()
+                while j < len(messages) and isinstance(messages[j], ToolMessage):
+                    tool_msg = messages[j]
+                    tool_id = getattr(tool_msg, "tool_call_id", None)
+                    if tool_id in requested_ids:
+                        collected_tools.append(tool_msg)
+                        collected_ids.add(tool_id)
+                    j += 1
+
+                if collected_ids == requested_ids:
+                    normalized.append(current)
+                    normalized.extend(collected_tools)
+                # If incomplete, drop the whole tool-call segment.
+                index = j
+                continue
+
+            normalized.append(current)
+            index += 1
+
+        return normalized

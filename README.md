@@ -165,9 +165,16 @@ Use `/llm` to inspect or switch providers at runtime:
 - `Shift+Enter` inserts newline when terminal sends a distinct sequence (also supports `Alt+Enter` and `Ctrl+J`).
 - Arrow keys navigate text and history.
 - `Shift+Arrow` extends selection in the input editor.
-- Typing `/` shows command completions, then filters as you keep typing.
+- Typing `/` shows command completions, including subcommand hints (for example `/llm local` and `/llm openai`), and filters as you type.
 
 Note: `Cmd+Arrow` usually does not reach terminal apps on macOS unless remapped by your terminal profile.
+
+## Logging and output
+
+- Default log level is `ERROR` for a cleaner CLI experience.
+- Set `LOG_LEVEL=INFO` (or `DEBUG`) if you want verbose diagnostics.
+- Rich colors are off by default to avoid ANSI artifacts in terminals that don't render them well.
+- Set `ASSISTANT_COLOR=1` to enable colored Rich output.
 
 ## Short-term memory design
 

@@ -4,7 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from assistant_cli.approval import ApprovalManager
 from assistant_cli.memory_store import SQLiteMemoryStore
@@ -31,6 +31,27 @@ class MemoryStoreTests(unittest.TestCase):
             self.assertTrue(truncated)
             self.assertGreaterEqual(len(trimmed), 1)
             self.assertEqual(trimmed[-1].content, "third turn")
+
+    def test_normalize_removes_orphan_tool_messages(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            store = SQLiteMemoryStore(
+                db_path=Path(tmp_dir) / "test.db",
+                session_id="s1",
+                token_limit=3000,
+                context_window=8000,
+            )
+
+            messages = [
+                HumanMessage(content="hello"),
+                ToolMessage(content="orphan", tool_call_id="missing"),
+                HumanMessage(content="next"),
+            ]
+
+            trimmed, truncated = store.enforce_token_limit(messages)
+            self.assertTrue(truncated)
+            self.assertEqual(len(trimmed), 2)
+            self.assertIsInstance(trimmed[0], HumanMessage)
+            self.assertIsInstance(trimmed[1], HumanMessage)
 
 
 class ApprovalManagerTests(unittest.TestCase):

@@ -119,7 +119,7 @@ class OllamaLLMClient:
                 if attempt >= self._config.retry_attempts:
                     break
                 delay = self._config.retry_backoff_seconds * attempt
-                LOGGER.warning(
+                LOGGER.debug(
                     "LLM call attempt %s/%s failed (%s). Retrying in %.1fs",
                     attempt,
                     self._config.retry_attempts,
@@ -149,7 +149,7 @@ class OllamaLLMClient:
                 try:
                     on_token(text)
                 except Exception:  # noqa: BLE001
-                    LOGGER.exception("Streaming callback failed")
+                    LOGGER.debug("Streaming callback failed", exc_info=True)
 
         if merged_chunk is None:
             fallback = await model.ainvoke(list(messages))
@@ -233,7 +233,7 @@ class OpenAILLMClient:
                 if attempt >= self._config.retry_attempts:
                     break
                 delay = self._config.retry_backoff_seconds * attempt
-                LOGGER.warning(
+                LOGGER.debug(
                     "LLM call attempt %s/%s failed (%s). Retrying in %.1fs",
                     attempt,
                     self._config.retry_attempts,
@@ -263,7 +263,7 @@ class OpenAILLMClient:
                 try:
                     on_token(text)
                 except Exception:  # noqa: BLE001
-                    LOGGER.exception("Streaming callback failed")
+                    LOGGER.debug("Streaming callback failed", exc_info=True)
 
         if merged_chunk is None:
             fallback = await model.ainvoke(list(messages))
