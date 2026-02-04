@@ -293,7 +293,7 @@ class AssistantCLI:
             )
 
     async def run(self) -> None:
-        await self.mcp_manager.refresh_connections()
+        await self._safe_refresh_mcp("startup")
         self._print_welcome()
 
         with patch_stdout():
@@ -314,10 +314,7 @@ class AssistantCLI:
                     try:
                         should_exit = await self._handle_command(user_input)
                     except asyncio.CancelledError:
-                        task = asyncio.current_task()
-                        if task is not None:
-                            while task.cancelling():
-                                task.uncancel()
+                        self._clear_current_task_cancellation()
                         self.console.print(
                             "Command was interrupted internally. You can continue.",
                             style="yellow",
@@ -328,6 +325,32 @@ class AssistantCLI:
                     continue
 
                 await self._handle_user_message(user_input)
+
+    def _clear_current_task_cancellation(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            return
+        while task.cancelling():
+            task.uncancel()
+
+    async def _safe_refresh_mcp(self, reason: str) -> bool:
+        try:
+            await self.mcp_manager.refresh_connections()
+            return True
+        except asyncio.CancelledError:
+            self._clear_current_task_cancellation()
+            self.console.print(
+                f"MCP refresh was interrupted during {reason}. You can continue.",
+                style="yellow",
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error("MCP refresh failed during %s: %s", reason, exc)
+            self.console.print(
+                f"MCP refresh failed during {reason}: {exc}",
+                style="bold red",
+            )
+            return False
 
     async def aclose(self) -> None:
         await self.agent.aclose()
@@ -422,7 +445,7 @@ class AssistantCLI:
             return
 
         if len(args) == 1 and args[0].lower() == "refresh":
-            await self.mcp_manager.refresh_connections()
+            await self._safe_refresh_mcp("mcp refresh command")
             self._print_mcp_status()
             return
 
@@ -434,7 +457,7 @@ class AssistantCLI:
 
             enabled = args[0].lower() == "on"
             self.mcp_manager.set_server_enabled(server_name, enabled)
-            await self.mcp_manager.refresh_connections()
+            await self._safe_refresh_mcp("mcp toggle command")
             self.console.print(
                 f"MCP server '{server_name}' set to {'enabled' if enabled else 'disabled'}.",
                 style="green" if enabled else "yellow",
@@ -478,17 +501,7 @@ class AssistantCLI:
             self.console.print(f"Failed to update allowed paths: {exc}", style="bold red")
             return
 
-        try:
-            await self.mcp_manager.refresh_connections()
-        except asyncio.CancelledError:
-            task = asyncio.current_task()
-            if task is not None:
-                while task.cancelling():
-                    task.uncancel()
-            self.console.print(
-                "MCP reconnect was interrupted; run /mcp refresh if needed.",
-                style="yellow",
-            )
+        await self._safe_refresh_mcp("paths update")
         self._print_allowed_paths()
 
     def _resolve_directory_alias(self, raw: str) -> str:
@@ -716,7 +729,7 @@ class AssistantCLI:
             self.console.print("Kept long-term memory.", style="dim")
             return
 
-        await self.mcp_manager.refresh_connections()
+        await self._safe_refresh_mcp("new long-term memory cleanup")
         tools = {tool.name: tool for tool in self.mcp_manager.active_tools()}
         try:
             success, message = await wipe_memory_graph(tools)
