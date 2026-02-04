@@ -89,8 +89,14 @@ If `/mcp` shows `connected=False`:
    npm logout
    npm login
    ```
-3. The fetch server package should be `mcp-server-fetch` (not `@modelcontextprotocol/server-fetch`).
-4. For `web_search`, export `BRAVE_API_KEY` before launching the app.
+3. Fetch server runs from Python package `mcp-server-fetch` via:
+   - command: `python`
+   - args: `-m mcp_server_fetch`
+4. Reinstall dependencies after updates:
+   ```bash
+   pip install -r requirements.txt
+   ```
+5. For `web_search`, export `BRAVE_API_KEY` before launching the app.
 
 ## Environment variables
 

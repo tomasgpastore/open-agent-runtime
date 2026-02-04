@@ -7,8 +7,8 @@
   },
   "fetch": {
     "transport": "stdio",
-    "command": "npx",
-    "args": ["-y", "mcp-server-fetch"],
+    "command": "python",
+    "args": ["-m", "mcp_server_fetch"],
     "enabled": true
   },
   "web_search": {
