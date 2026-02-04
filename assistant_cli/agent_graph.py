@@ -231,7 +231,10 @@ class LangGraphAgent:
                 "stop_reason": "llm_error",
                 "messages": [
                     AIMessage(
-                        content=f"I could not complete the request due to an LLM error: {exc}"
+                        content=(
+                            "I hit an LLM backend error and couldn't finish this request. "
+                            "Try `/new` to reset the session, or switch model/provider with `/llm`."
+                        )
                     )
                 ],
             }

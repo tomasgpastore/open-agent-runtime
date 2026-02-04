@@ -12,7 +12,6 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
-from prompt_toolkit.selection import SelectionType
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -38,8 +37,13 @@ LOGGER = logging.getLogger(__name__)
 
 
 class SlashCommandCompleter(Completer):
-    def __init__(self, suggestions_provider: Callable[[], Sequence[str]]) -> None:
-        self._suggestions_provider = suggestions_provider
+    def __init__(
+        self,
+        root_commands_provider: Callable[[], Sequence[str]],
+        subcommands_provider: Callable[[str], Sequence[str]],
+    ) -> None:
+        self._root_commands_provider = root_commands_provider
+        self._subcommands_provider = subcommands_provider
 
     def get_completions(self, document, complete_event):  # type: ignore[override]
         text_before_cursor = document.text_before_cursor
@@ -48,12 +52,31 @@ class SlashCommandCompleter(Completer):
         if "\n" in text_before_cursor:
             return
 
-        for command in sorted(set(self._suggestions_provider())):
-            if command.startswith(text_before_cursor):
-                yield Completion(
-                    command,
-                    start_position=-len(text_before_cursor),
-                )
+        stripped = text_before_cursor.strip()
+        trailing_space = text_before_cursor.endswith(" ")
+        parts = stripped.split()
+        if not parts:
+            return
+
+        root = parts[0]
+        root_commands = sorted(set(self._root_commands_provider()))
+        if len(parts) == 1 and not trailing_space:
+            for command in root_commands:
+                if command.startswith(root):
+                    yield Completion(command, start_position=-len(root))
+            return
+
+        if root not in root_commands:
+            return
+
+        subcommands = sorted(set(self._subcommands_provider(root)))
+        if not subcommands:
+            return
+
+        for option in subcommands:
+            candidate = f"{root} {option}"
+            if candidate.startswith(text_before_cursor):
+                yield Completion(candidate, start_position=-len(text_before_cursor))
 
 
 class ResponseStreamPrinter:
@@ -137,52 +160,12 @@ class AssistantCLI:
         def _(event) -> None:
             event.current_buffer.insert_text("\n")
 
-        # Common Shift+Enter escape sequences used by terminals with CSI-u / modifyOtherKeys.
-        for sequence in (
-            ("escape", "[", "1", "3", ";", "2", "u"),
-            ("escape", "[", "2", "7", ";", "2", ";", "1", "3", "~"),
-            ("escape", "[", "1", "3", ";", "2", "~"),
-        ):
-            key_bindings.add(*sequence)(lambda event: event.current_buffer.insert_text("\n"))
-
-        def _ensure_selection(event) -> None:
-            buffer = event.current_buffer
-            if buffer.selection_state is None:
-                buffer.start_selection(selection_type=SelectionType.CHARACTERS)
-
-        @key_bindings.add("s-left")
-        def _(event) -> None:
-            _ensure_selection(event)
-            event.current_buffer.cursor_left(count=1)
-
-        @key_bindings.add("s-right")
-        def _(event) -> None:
-            _ensure_selection(event)
-            event.current_buffer.cursor_right(count=1)
-
-        @key_bindings.add("s-up")
-        def _(event) -> None:
-            _ensure_selection(event)
-            event.current_buffer.cursor_up(count=1)
-
-        @key_bindings.add("s-down")
-        def _(event) -> None:
-            _ensure_selection(event)
-            event.current_buffer.cursor_down(count=1)
-
-        @key_bindings.add("s-home")
-        def _(event) -> None:
-            _ensure_selection(event)
-            event.current_buffer.cursor_position += event.current_buffer.document.get_start_of_line_position()
-
-        @key_bindings.add("s-end")
-        def _(event) -> None:
-            _ensure_selection(event)
-            event.current_buffer.cursor_position += event.current_buffer.document.get_end_of_line_position()
-
         return PromptSession(
             multiline=True,
-            completer=SlashCommandCompleter(self._command_suggestions),
+            completer=SlashCommandCompleter(
+                root_commands_provider=self._root_commands,
+                subcommands_provider=self._subcommand_options,
+            ),
             complete_while_typing=True,
             complete_in_thread=True,
             key_bindings=key_bindings,
@@ -622,34 +605,34 @@ class AssistantCLI:
         self.console.print(table)
         self.console.print(
             Panel.fit(
-                "Enter sends\nShift+Enter/Alt+Enter/Ctrl+J inserts newline\n"
+                "Enter sends\nAlt+Enter/Ctrl+J inserts newline\n"
                 "Arrow keys navigate text/history\n"
-                "Shift+Arrow selects text\n"
-                "Typing / triggers command autocomplete",
+                "Selection/editing follows prompt-toolkit native behavior\n"
+                "Typing / triggers contextual command autocomplete",
                 title="Editor",
                 border_style="blue",
             )
         )
 
-    def _command_suggestions(self) -> list[str]:
+    def _root_commands(self) -> list[str]:
         return [
             "/mcp",
-            "/mcp refresh",
-            "/mcp on ",
-            "/mcp off ",
             "/approval",
-            "/approval global on",
-            "/approval global off",
-            "/approval tool ",
             "/memory",
             "/llm",
-            "/llm local ",
-            "/llm openai",
-            "/llm openai ",
             "/new",
             "/quit",
             "/help",
         ]
+
+    def _subcommand_options(self, root_command: str) -> list[str]:
+        if root_command == "/mcp":
+            return ["refresh", "on <server>", "off <server>"]
+        if root_command == "/approval":
+            return ["global on", "global off", "tool <tool_name> on", "tool <tool_name> off"]
+        if root_command == "/llm":
+            return ["local <model>", "openai <model>"]
+        return []
 
     def _parse_on_off(self, value: str) -> bool | None:
         normalized = value.lower()
