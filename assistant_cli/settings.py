@@ -11,6 +11,8 @@ DEFAULT_OLLAMA_BASE_URL = "http://100.126.228.118:11434"
 DEFAULT_MODEL = "ministral-3:8b"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_OPENROUTER_MODEL = "moonshotai/kimi-k2.5"
 
 
 @dataclass(slots=True)
@@ -19,6 +21,8 @@ class AppSettings:
     ollama_model: str = DEFAULT_MODEL
     openai_base_url: str = DEFAULT_OPENAI_BASE_URL
     openai_model: str = DEFAULT_OPENAI_MODEL
+    openrouter_base_url: str = DEFAULT_OPENROUTER_BASE_URL
+    openrouter_model: str = DEFAULT_OPENROUTER_MODEL
     ollama_temperature: float = 0.1
     model_context_window: int = 20000
     short_term_token_limit: int = 20000
@@ -71,6 +75,8 @@ def load_settings() -> AppSettings:
         ollama_model=os.getenv("OLLAMA_MODEL", DEFAULT_MODEL),
         openai_base_url=os.getenv("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
         openai_model=os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
+        openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL),
+        openrouter_model=os.getenv("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL),
         ollama_temperature=_get_float("OLLAMA_TEMPERATURE", 0.1),
         model_context_window=_get_int("MODEL_CONTEXT_WINDOW", 20000),
         short_term_token_limit=_get_int("SHORT_TERM_TOKEN_LIMIT", 20000),

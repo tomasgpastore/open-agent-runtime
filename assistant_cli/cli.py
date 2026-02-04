@@ -153,6 +153,8 @@ class AssistantCLI:
         try:
             if provider == "openai":
                 return self._build_openai_llm_client(model=model)
+            if provider == "openrouter":
+                return self._build_openrouter_llm_client(model=model)
             return self._build_local_llm_client(model=model)
         except Exception as exc:  # noqa: BLE001
             self.console.print(
@@ -179,7 +181,7 @@ class AssistantCLI:
             return None
         provider = llm_data.get("provider")
         model = llm_data.get("model")
-        if provider not in {"local", "openai"}:
+        if provider not in {"local", "openai", "openrouter"}:
             return None
         if not isinstance(model, str) or not model.strip():
             return None
@@ -270,12 +272,42 @@ class AssistantCLI:
             )
         )
 
+    def _build_openrouter_llm_client(self, model: str) -> OpenAILLMClient:
+        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("OPENROUTER_API_KEY is not set.")
+
+        app_url = os.getenv("OPENROUTER_APP_URL", "").strip()
+        app_name = os.getenv("OPENROUTER_APP_NAME", "LangGraph MCP Assistant").strip()
+        headers: dict[str, str] = {}
+        if app_url:
+            headers["HTTP-Referer"] = app_url
+        if app_name:
+            headers["X-Title"] = app_name
+
+        return OpenAILLMClient(
+            OpenAILLMConfig(
+                api_key=api_key,
+                model=model,
+                base_url=self.settings.openrouter_base_url,
+                temperature=self.settings.ollama_temperature,
+                timeout_seconds=self.settings.llm_request_timeout_seconds,
+                retry_attempts=self.settings.llm_retry_attempts,
+                retry_backoff_seconds=self.settings.llm_retry_backoff_seconds,
+                default_headers=headers,
+                # Kimi 2.5 supports reasoning controls through OpenRouter.
+                reasoning={"enabled": True},
+            )
+        )
+
     def _switch_provider(self, provider: str, model: str) -> None:
         provider_changed = self.current_provider != provider
         if provider == "local":
             client = self._build_local_llm_client(model=model)
         elif provider == "openai":
             client = self._build_openai_llm_client(model=model)
+        elif provider == "openrouter":
+            client = self._build_openrouter_llm_client(model=model)
         else:
             raise ValueError(f"Unsupported provider: {provider}")
 
@@ -298,6 +330,7 @@ class AssistantCLI:
 
         with patch_stdout():
             while True:
+                self._clear_current_task_cancellation()
                 try:
                     raw = await self._prompt("<ansicyan>you&gt; </ansicyan>", multiline=True)
                 except EOFError:
@@ -627,7 +660,10 @@ class AssistantCLI:
         if not args:
             self.console.print(f"Current provider: {self.current_provider}", style="bold")
             self.console.print(f"Current model: {self.current_model}", style="bold")
-            self.console.print("Usage: /llm local [model] | /llm openai [model]", style="yellow")
+            self.console.print(
+                "Usage: /llm local [model] | /llm openai [model] | /llm openrouter [model]",
+                style="yellow",
+            )
             return
 
         provider = args[0].lower()
@@ -714,7 +750,24 @@ class AssistantCLI:
             self.console.print(f"Switched LLM provider to openai ({selected_model}).", style="green")
             return
 
-        self.console.print("Usage: /llm local [model] | /llm openai [model]", style="yellow")
+        if provider == "openrouter":
+            self.console.print(
+                "Note: OpenRouter uses API billing and requires OPENROUTER_API_KEY.",
+                style="yellow",
+            )
+            model = args[1] if len(args) > 1 else self.settings.openrouter_model
+            try:
+                self._switch_provider(provider="openrouter", model=model)
+            except RuntimeError as exc:
+                self.console.print(str(exc), style="bold red")
+                return
+            self.console.print(f"Switched LLM provider to openrouter ({model}).", style="green")
+            return
+
+        self.console.print(
+            "Usage: /llm local [model] | /llm openai [model] | /llm openrouter [model]",
+            style="yellow",
+        )
 
     async def _handle_new_command(self) -> None:
         self.memory_store.clear_session()
@@ -729,22 +782,39 @@ class AssistantCLI:
             self.console.print("Kept long-term memory.", style="dim")
             return
 
-        await self._safe_refresh_mcp("new long-term memory cleanup")
         tools = {tool.name: tool for tool in self.mcp_manager.active_tools()}
+        if not tools:
+            self.console.print(
+                "No MCP tools are currently active. Run /mcp refresh and retry /new if needed.",
+                style="yellow",
+            )
+            return
         try:
             success, message = await wipe_memory_graph(tools)
             self.console.print(message, style="green" if success else "yellow")
             if not success:
                 self.console.print("Long-term memory wipe was not completed.", style="yellow")
+        except asyncio.CancelledError:
+            self._clear_current_task_cancellation()
+            self.console.print(
+                "Long-term memory wipe was interrupted internally. You can continue.",
+                style="yellow",
+            )
         except Exception as exc:  # noqa: BLE001
             LOGGER.error("Failed to wipe long-term memory: %s", exc)
             self.console.print(f"Failed to wipe long-term memory: {exc}", style="bold red")
 
     def _print_welcome(self) -> None:
+        if self.current_provider == "local":
+            provider_endpoint = f"Ollama base URL: {self.settings.ollama_base_url}"
+        elif self.current_provider == "openai":
+            provider_endpoint = f"OpenAI base URL: {self.settings.openai_base_url}"
+        else:
+            provider_endpoint = f"OpenRouter base URL: {self.settings.openrouter_base_url}"
         body = (
             f"Model: {self.current_model}\n"
             f"LLM provider: {self.current_provider}\n"
-            f"Ollama base URL: {self.settings.ollama_base_url}\n"
+            f"{provider_endpoint}\n"
             "Tip: Type /help for available commands."
         )
         self.console.print(Panel.fit(body, title="LangGraph MCP Assistant", border_style="cyan"))
@@ -766,6 +836,7 @@ class AssistantCLI:
         table.add_row("/paths remove <path>", "Remove an allowed filesystem path")
         table.add_row("/llm local [model]", "Switch to local Ollama model")
         table.add_row("/llm openai [model]", "Switch to OpenAI model")
+        table.add_row("/llm openrouter [model]", "Switch to OpenRouter model (default Kimi 2.5)")
         table.add_row("/new", "Reset short-term memory")
         table.add_row("/quit", "Exit")
         self.console.print(table)
@@ -800,7 +871,7 @@ class AssistantCLI:
         if root_command == "/paths":
             return ["list", "add <path>", "add downloads", "add desktop", "add documents", "remove <path>"]
         if root_command == "/llm":
-            return ["local <model>", "openai <model>"]
+            return ["local <model>", "openai <model>", "openrouter <model>"]
         return []
 
     def _parse_on_off(self, value: str) -> bool | None:
@@ -818,6 +889,8 @@ def run() -> None:
     app = AssistantCLI()
     try:
         asyncio.run(app.run())
+    except asyncio.CancelledError:
+        app.console.print("Session interruption handled. You can restart safely.", style="yellow")
     except KeyboardInterrupt:
         app.console.print("\nInterrupted. Goodbye.", style="bold yellow")
     finally:

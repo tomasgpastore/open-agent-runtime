@@ -4,7 +4,7 @@ import asyncio
 import logging
 import re
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Protocol, Sequence
 
 import httpx
@@ -76,6 +76,9 @@ class OpenAILLMConfig:
     timeout_seconds: int = 90
     retry_attempts: int = 3
     retry_backoff_seconds: float = 1.5
+    default_headers: dict[str, str] = field(default_factory=dict)
+    reasoning: dict[str, object] | None = None
+    extra_body: dict[str, object] | None = None
 
 
 class OllamaLLMClient:
@@ -214,6 +217,9 @@ class OpenAILLMClient:
             temperature=config.temperature,
             timeout=config.timeout_seconds,
             max_retries=0,
+            default_headers=config.default_headers or None,
+            reasoning=config.reasoning,
+            extra_body=config.extra_body,
         )
 
     @property

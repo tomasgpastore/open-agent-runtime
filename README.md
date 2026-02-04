@@ -114,6 +114,9 @@ export OLLAMA_MODEL="ministral-3:8b"
 export OPENAI_BASE_URL="https://api.openai.com/v1"
 export OPENAI_MODEL="gpt-4o-mini"
 export OPENAI_API_KEY="..."
+export OPENROUTER_BASE_URL="https://openrouter.ai/api/v1"
+export OPENROUTER_MODEL="moonshotai/kimi-k2.5"
+export OPENROUTER_API_KEY="..."
 
 # Optional tuning
 export OLLAMA_TEMPERATURE="0.1"
@@ -175,6 +178,7 @@ Use `/llm` to inspect or switch providers at runtime:
 - `/llm local [model]` switches to local Ollama.
 - `/llm openai` lists available OpenAI models and prompts selection.
 - `/llm openai <model>` switches directly to a specific OpenAI model.
+- `/llm openrouter [model]` switches to OpenRouter (default: `moonshotai/kimi-k2.5`).
 - The selected provider/model is persisted to `data/runtime_state.json` and restored on restart.
 
 ## Terminal editing
@@ -215,6 +219,7 @@ Note: `Cmd+Arrow` usually does not reach terminal apps on macOS unless remapped 
 - `/new` clears short-term memory and asks:
   - `Also clear long-term memory, yes or no?`
 - If yes, assistant tries to wipe entities and relations from memory graph safely.
+  - Wipe uses currently active MCP memory tools (no forced reconnect).
 
 ## Agent loop details
 
