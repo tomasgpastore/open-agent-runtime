@@ -11,7 +11,7 @@ from typing import Annotated, Callable, TypedDict
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
@@ -59,16 +59,28 @@ class LangGraphAgent:
         self._max_iterations = max_iterations
         self._request_timeout_seconds = request_timeout_seconds
         self._tool_timeout_seconds = tool_timeout_seconds
+        self._db_path = db_path
 
-        self._checkpointer_cm = SqliteSaver.from_conn_string(str(db_path))
-        self._checkpointer = self._checkpointer_cm.__enter__()
+        self._checkpointer_cm: AsyncSqliteSaver | None = None
+        self._checkpointer: AsyncSqliteSaver | None = None
+        self._graph = None
 
-        self._graph = self._build_graph()
+    async def _ensure_graph(self) -> None:
+        if self._graph is not None:
+            return
+        self._checkpointer_cm = AsyncSqliteSaver.from_conn_string(str(self._db_path))
+        self._checkpointer = await self._checkpointer_cm.__aenter__()
+        self._graph = self._build_graph(self._checkpointer)
 
-    def close(self) -> None:
-        self._checkpointer_cm.__exit__(None, None, None)
+    async def aclose(self) -> None:
+        if self._checkpointer_cm is None:
+            return
+        await self._checkpointer_cm.__aexit__(None, None, None)
+        self._checkpointer_cm = None
+        self._checkpointer = None
+        self._graph = None
 
-    def _build_graph(self):
+    def _build_graph(self, checkpointer: AsyncSqliteSaver):
         workflow = StateGraph(AgentState)
         workflow.add_node("router", self._router_node)
         workflow.add_node("tool_executor", self._tool_executor_node)
@@ -91,7 +103,7 @@ class LangGraphAgent:
             },
         )
 
-        return workflow.compile(checkpointer=self._checkpointer)
+        return workflow.compile(checkpointer=checkpointer)
 
     async def _router_node(self, state: AgentState, config: RunnableConfig) -> dict:
         iteration = state.get("iteration", 0)
@@ -232,6 +244,7 @@ class LangGraphAgent:
         approval_manager: ApprovalManager,
         input_fn: Callable[[str], str] = input,
     ) -> AgentRunResult:
+        await self._ensure_graph()
         thread_id = f"request-{uuid.uuid4()}"
         config: RunnableConfig = {
             "configurable": {
@@ -249,6 +262,9 @@ class LangGraphAgent:
             "iteration": 0,
             "stop_reason": None,
         }
+
+        if self._graph is None:
+            raise RuntimeError("Agent graph was not initialized.")
 
         final_state: AgentState = await asyncio.wait_for(
             self._graph.ainvoke(initial_state, config=config),

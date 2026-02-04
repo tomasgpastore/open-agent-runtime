@@ -75,8 +75,8 @@ class AssistantCLI:
 
             await self._handle_user_message(user_input)
 
-    def close(self) -> None:
-        self.agent.close()
+    async def aclose(self) -> None:
+        await self.agent.aclose()
 
     async def _handle_user_message(self, user_input: str) -> None:
         history = self.memory_store.load_messages()
@@ -298,4 +298,4 @@ def run() -> None:
     except KeyboardInterrupt:
         print("\nInterrupted. Goodbye.")
     finally:
-        app.close()
+        asyncio.run(app.aclose())
