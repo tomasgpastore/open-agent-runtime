@@ -136,7 +136,10 @@ class MCPManager:
 
             client = MultiServerMCPClient({name: cfg.to_connection_dict()})
             try:
-                tools = await client.get_tools(tool_name_prefix=True)
+                try:
+                    tools = await client.get_tools(tool_name_prefix=True)
+                except TypeError:
+                    tools = await client.get_tools()
                 self._connected[name] = True
                 self._tools_by_server[name] = tools
                 for tool in tools:

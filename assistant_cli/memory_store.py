@@ -86,7 +86,8 @@ class SQLiteMemoryStore:
         working = list(messages)
         truncated = False
 
-        while working and self.estimate_tokens(working) > self._token_limit:
+        # Keep at least the most recent message so the current user turn is never dropped.
+        while len(working) > 1 and self.estimate_tokens(working) > self._token_limit:
             working.pop(0)
             truncated = True
 
