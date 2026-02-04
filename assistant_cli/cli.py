@@ -269,6 +269,7 @@ class AssistantCLI:
                 timeout_seconds=self.settings.llm_request_timeout_seconds,
                 retry_attempts=self.settings.llm_retry_attempts,
                 retry_backoff_seconds=self.settings.llm_retry_backoff_seconds,
+                max_completion_tokens=self.settings.openai_max_completion_tokens,
             )
         )
 
@@ -294,6 +295,7 @@ class AssistantCLI:
                 timeout_seconds=self.settings.llm_request_timeout_seconds,
                 retry_attempts=self.settings.llm_retry_attempts,
                 retry_backoff_seconds=self.settings.llm_retry_backoff_seconds,
+                max_completion_tokens=self.settings.openrouter_max_completion_tokens,
                 default_headers=headers,
                 # Kimi 2.5 supports reasoning controls through OpenRouter.
                 reasoning={"enabled": True},

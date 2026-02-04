@@ -114,9 +114,11 @@ export OLLAMA_MODEL="ministral-3:8b"
 export OPENAI_BASE_URL="https://api.openai.com/v1"
 export OPENAI_MODEL="gpt-4o-mini"
 export OPENAI_API_KEY="..."
+export OPENAI_MAX_COMPLETION_TOKENS="4096"
 export OPENROUTER_BASE_URL="https://openrouter.ai/api/v1"
 export OPENROUTER_MODEL="moonshotai/kimi-k2.5"
 export OPENROUTER_API_KEY="..."
+export OPENROUTER_MAX_COMPLETION_TOKENS="4096"
 
 # Optional tuning
 export OLLAMA_TEMPERATURE="0.1"

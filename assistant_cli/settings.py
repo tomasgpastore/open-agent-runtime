@@ -21,8 +21,10 @@ class AppSettings:
     ollama_model: str = DEFAULT_MODEL
     openai_base_url: str = DEFAULT_OPENAI_BASE_URL
     openai_model: str = DEFAULT_OPENAI_MODEL
+    openai_max_completion_tokens: int = 4096
     openrouter_base_url: str = DEFAULT_OPENROUTER_BASE_URL
     openrouter_model: str = DEFAULT_OPENROUTER_MODEL
+    openrouter_max_completion_tokens: int = 4096
     ollama_temperature: float = 0.1
     model_context_window: int = 20000
     short_term_token_limit: int = 20000
@@ -75,8 +77,10 @@ def load_settings() -> AppSettings:
         ollama_model=os.getenv("OLLAMA_MODEL", DEFAULT_MODEL),
         openai_base_url=os.getenv("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
         openai_model=os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
+        openai_max_completion_tokens=_get_int("OPENAI_MAX_COMPLETION_TOKENS", 4096),
         openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL),
         openrouter_model=os.getenv("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL),
+        openrouter_max_completion_tokens=_get_int("OPENROUTER_MAX_COMPLETION_TOKENS", 4096),
         ollama_temperature=_get_float("OLLAMA_TEMPERATURE", 0.1),
         model_context_window=_get_int("MODEL_CONTEXT_WINDOW", 20000),
         short_term_token_limit=_get_int("SHORT_TERM_TOKEN_LIMIT", 20000),

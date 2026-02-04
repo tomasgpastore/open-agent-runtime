@@ -76,6 +76,7 @@ class OpenAILLMConfig:
     timeout_seconds: int = 90
     retry_attempts: int = 3
     retry_backoff_seconds: float = 1.5
+    max_completion_tokens: int | None = None
     default_headers: dict[str, str] = field(default_factory=dict)
     reasoning: dict[str, object] | None = None
     extra_body: dict[str, object] | None = None
@@ -217,6 +218,7 @@ class OpenAILLMClient:
             temperature=config.temperature,
             timeout=config.timeout_seconds,
             max_retries=0,
+            max_completion_tokens=config.max_completion_tokens,
             default_headers=config.default_headers or None,
             reasoning=config.reasoning,
             extra_body=config.extra_body,
