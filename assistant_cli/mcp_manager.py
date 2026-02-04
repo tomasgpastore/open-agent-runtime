@@ -226,3 +226,78 @@ class MCPManager:
             return None
         prefix, _ = tool_name.split("_", 1)
         return prefix if prefix in self._servers else None
+
+    def list_filesystem_allowed_directories(self) -> list[str]:
+        cfg = self._get_filesystem_server_config()
+        _, directories = self._split_filesystem_args(cfg)
+        return directories
+
+    def add_filesystem_allowed_directory(self, directory: str) -> str:
+        cfg = self._get_filesystem_server_config()
+        normalized = str(Path(directory).expanduser().resolve(strict=False))
+
+        _, directories = self._split_filesystem_args(cfg)
+        if normalized in directories:
+            return normalized
+
+        self._set_filesystem_allowed_directories(cfg, [*directories, normalized])
+        return normalized
+
+    def remove_filesystem_allowed_directory(self, directory: str) -> str:
+        cfg = self._get_filesystem_server_config()
+        normalized = str(Path(directory).expanduser().resolve(strict=False))
+
+        _, directories = self._split_filesystem_args(cfg)
+        if normalized not in directories:
+            raise KeyError(f"Directory is not currently allowed: {normalized}")
+
+        updated = [item for item in directories if item != normalized]
+        if not updated:
+            raise ValueError("At least one allowed directory must remain for filesystem MCP.")
+
+        self._set_filesystem_allowed_directories(cfg, updated)
+        return normalized
+
+    def _get_filesystem_server_config(self) -> MCPServerConfig:
+        cfg = self._servers.get("filesystem")
+        if not cfg:
+            raise KeyError("Filesystem MCP server is not configured.")
+        if cfg.transport != "stdio":
+            raise ValueError("Filesystem MCP management currently supports stdio transport only.")
+        return cfg
+
+    def _split_filesystem_args(self, cfg: MCPServerConfig) -> tuple[list[str], list[str]]:
+        args = list(cfg.args or [])
+        if not args:
+            if (cfg.command or "").strip() == "npx":
+                return ["-y", "@modelcontextprotocol/server-filesystem"], []
+            raise ValueError("Filesystem MCP server args are missing and could not be inferred.")
+
+        package_index = -1
+        for idx, token in enumerate(args):
+            if "server-filesystem" in token:
+                package_index = idx
+                break
+
+        if package_index < 0:
+            if (cfg.command or "").strip() == "npx":
+                return ["-y", "@modelcontextprotocol/server-filesystem"], []
+            raise ValueError(
+                "Could not detect filesystem server executable token in args."
+            )
+
+        prefix = args[: package_index + 1]
+        directories = [str(Path(item).expanduser().resolve(strict=False)) for item in args[package_index + 1 :]]
+        return prefix, directories
+
+    def _set_filesystem_allowed_directories(
+        self,
+        cfg: MCPServerConfig,
+        directories: list[str],
+    ) -> None:
+        deduped: list[str] = []
+        for path in directories:
+            if path not in deduped:
+                deduped.append(path)
+        cfg.args = [*self._split_filesystem_args(cfg)[0], *deduped]
+        self._persist_config()

@@ -324,6 +324,10 @@ class AssistantCLI:
             self._handle_memory_command()
             return False
 
+        if command == "/paths":
+            await self._handle_paths_command(parts[1:])
+            return False
+
         if command == "/llm":
             await self._handle_llm_command(parts[1:])
             return False
@@ -366,6 +370,63 @@ class AssistantCLI:
             return
 
         self.console.print("Usage: /mcp | /mcp refresh | /mcp on <server> | /mcp off <server>", style="yellow")
+
+    async def _handle_paths_command(self, args: Sequence[str]) -> None:
+        if not args or args[0].lower() == "list":
+            self._print_allowed_paths()
+            return
+
+        action = args[0].lower()
+        if action not in {"add", "remove"}:
+            self.console.print("Usage: /paths | /paths add <path|downloads|desktop|documents> | /paths remove <path>", style="yellow")
+            return
+
+        if len(args) < 2:
+            self.console.print("Path is required.", style="yellow")
+            return
+
+        raw_path = " ".join(args[1:]).strip()
+        target_path = self._resolve_directory_alias(raw_path)
+
+        try:
+            if action == "add":
+                added = self.mcp_manager.add_filesystem_allowed_directory(target_path)
+                self.console.print(f"Added filesystem allowed path: {added}", style="green")
+            else:
+                removed = self.mcp_manager.remove_filesystem_allowed_directory(target_path)
+                self.console.print(f"Removed filesystem allowed path: {removed}", style="green")
+        except Exception as exc:  # noqa: BLE001
+            self.console.print(f"Failed to update allowed paths: {exc}", style="bold red")
+            return
+
+        await self.mcp_manager.refresh_connections()
+        self._print_allowed_paths()
+
+    def _resolve_directory_alias(self, raw: str) -> str:
+        aliases = {
+            "downloads": "~/Downloads",
+            "desktop": "~/Desktop",
+            "documents": "~/Documents",
+        }
+        return aliases.get(raw.lower(), raw)
+
+    def _print_allowed_paths(self) -> None:
+        try:
+            paths = self.mcp_manager.list_filesystem_allowed_directories()
+        except Exception as exc:  # noqa: BLE001
+            self.console.print(f"Failed to read filesystem allowed paths: {exc}", style="bold red")
+            return
+
+        table = Table(title="Filesystem Allowed Paths")
+        table.add_column("Path", style="bold")
+        table.add_column("Exists")
+        if not paths:
+            table.add_row("(none)", "n/a")
+        else:
+            for path in paths:
+                exists = "yes" if os.path.exists(path) else "no"
+                table.add_row(path, exists)
+        self.console.print(table)
 
     def _print_mcp_status(self) -> None:
         table = Table(title="MCP Servers", show_lines=True)
@@ -598,6 +659,9 @@ class AssistantCLI:
         table.add_row("/approval global on|off", "Toggle global approval")
         table.add_row("/approval tool <tool> on|off", "Toggle approval for one tool")
         table.add_row("/memory", "Show short-term memory stats")
+        table.add_row("/paths", "List filesystem allowed paths")
+        table.add_row("/paths add <path>", "Allow filesystem access to a path")
+        table.add_row("/paths remove <path>", "Remove an allowed filesystem path")
         table.add_row("/llm local [model]", "Switch to local Ollama model")
         table.add_row("/llm openai [model]", "Switch to OpenAI model")
         table.add_row("/new", "Reset short-term memory")
@@ -619,6 +683,7 @@ class AssistantCLI:
             "/mcp",
             "/approval",
             "/memory",
+            "/paths",
             "/llm",
             "/new",
             "/quit",
@@ -630,6 +695,8 @@ class AssistantCLI:
             return ["refresh", "on <server>", "off <server>"]
         if root_command == "/approval":
             return ["global on", "global off", "tool <tool_name> on", "tool <tool_name> off"]
+        if root_command == "/paths":
+            return ["list", "add <path>", "add downloads", "add desktop", "add documents", "remove <path>"]
         if root_command == "/llm":
             return ["local <model>", "openai <model>"]
         return []

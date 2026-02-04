@@ -13,6 +13,7 @@ Production-quality Python CLI personal assistant using:
   - `/mcp`
   - `/approval`
   - `/memory`
+  - `/paths`
   - `/llm`
   - `/new`
   - `/quit`
@@ -150,6 +151,14 @@ Example server definitions include:
 Each server has `enabled` and transport settings. You can toggle at runtime:
 - `/mcp on <server>`
 - `/mcp off <server>`
+
+### Filesystem allowed paths
+
+Use `/paths` to manage directories exposed by the filesystem MCP server:
+- `/paths` or `/paths list` shows current allowed paths.
+- `/paths add <path>` adds a directory.
+- `/paths add downloads|desktop|documents` adds common macOS folders quickly.
+- `/paths remove <path>` removes a directory (at least one must remain).
 
 ## LLM provider switching
 

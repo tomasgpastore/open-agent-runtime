@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import json
 import unittest
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from assistant_cli.approval import ApprovalManager
+from assistant_cli.mcp_manager import MCPManager
 from assistant_cli.memory_store import SQLiteMemoryStore
 
 
@@ -62,6 +64,35 @@ class ApprovalManagerTests(unittest.TestCase):
 
         self.assertTrue(approval.tool_enabled("memory_read_graph"))
         self.assertFalse(approval.tool_enabled("filesystem_read_file"))
+
+
+class MCPManagerTests(unittest.TestCase):
+    def test_update_filesystem_allowed_paths(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            config_path = tmp / "mcp.json"
+            config_payload = {
+                "filesystem": {
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem", str(tmp)],
+                    "enabled": True,
+                }
+            }
+            config_path.write_text(json.dumps(config_payload), encoding="utf-8")
+
+            manager = MCPManager(config_path=config_path, fallback_config_path=config_path)
+            original_paths = manager.list_filesystem_allowed_directories()
+            self.assertEqual(len(original_paths), 1)
+
+            extra = tmp / "extra"
+            extra.mkdir(parents=True, exist_ok=True)
+            added = manager.add_filesystem_allowed_directory(str(extra))
+            self.assertIn(added, manager.list_filesystem_allowed_directories())
+
+            removed = manager.remove_filesystem_allowed_directory(str(extra))
+            self.assertEqual(removed, added)
+            self.assertEqual(len(manager.list_filesystem_allowed_directories()), 1)
 
 
 if __name__ == "__main__":
