@@ -46,7 +46,7 @@ Production-quality Python CLI personal assistant using:
 
 ## Requirements
 
-- Python **3.12+**
+- Python **3.12.x** (recommended)
 - Node.js + `npx` (for stdio MCP servers)
 - Reachable remote Ollama server
 
@@ -58,6 +58,23 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp config/mcp_servers.sample.json config/mcp_servers.json
 ```
+
+## Dependency troubleshooting
+
+If install fails with an `mcp` resolver conflict:
+
+1. Confirm interpreter version:
+   ```bash
+   python --version
+   ```
+2. Recreate the venv with Python 3.12 specifically:
+   ```bash
+   rm -rf .venv
+   python3.12 -m venv .venv
+   source .venv/bin/activate
+   pip install -U pip
+   pip install -r requirements.txt
+   ```
 
 ## Environment variables
 
