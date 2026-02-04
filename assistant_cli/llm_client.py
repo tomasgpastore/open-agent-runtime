@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Callable, Protocol, Sequence
 
@@ -9,11 +11,25 @@ import httpx
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langchain_core.messages.utils import message_chunk_to_message
 from langchain_core.tools import BaseTool
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 
 
 LOGGER = logging.getLogger(__name__)
+INVALID_FUNCTION_NAME_PATTERN = re.compile(r"function ['\"]([^'\"]+)['\"]")
+INVALID_TOOL_INDEX_PATTERN = re.compile(r"tools\[(\d+)\]")
+NUMERIC_SCHEMA_KEYS = {
+    "minimum",
+    "maximum",
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+    "multipleOf",
+    "minProperties",
+    "maxProperties",
+}
 
 
 class LLMCallError(RuntimeError):
@@ -210,10 +226,15 @@ class OpenAILLMClient:
         tools: Sequence[BaseTool] | None = None,
         on_token: Callable[[str], None] | None = None,
     ) -> AIMessage:
-        model = self._base_model.bind_tools(tools) if tools else self._base_model
+        tool_definitions = self._prepare_openai_tools(tools or []) if tools else []
         last_error: Exception | None = None
 
         for attempt in range(1, self._config.retry_attempts + 1):
+            model = (
+                self._base_model.bind_tools(tool_definitions)
+                if tool_definitions
+                else self._base_model
+            )
             try:
                 if on_token is None:
                     response = await model.ainvoke(list(messages))
@@ -229,6 +250,12 @@ class OpenAILLMClient:
                     )
                 return response
             except Exception as exc:  # noqa: BLE001
+                if tool_definitions and self._is_invalid_tool_schema_error(exc):
+                    reduced = self._drop_incompatible_tool(tool_definitions, exc)
+                    if reduced is not None and len(reduced) < len(tool_definitions):
+                        tool_definitions = reduced
+                        last_error = exc
+                        continue
                 last_error = exc
                 if attempt >= self._config.retry_attempts:
                     break
@@ -294,6 +321,89 @@ class OpenAILLMClient:
                         parts.append(text)
             return "".join(parts)
         return ""
+
+    def _prepare_openai_tools(self, tools: Sequence[BaseTool]) -> list[dict]:
+        prepared: list[dict] = []
+        for tool in tools:
+            try:
+                definition = convert_to_openai_tool(tool)
+            except Exception:  # noqa: BLE001
+                continue
+
+            if not isinstance(definition, dict):
+                continue
+
+            normalized = deepcopy(definition)
+            function_data = normalized.get("function")
+            if isinstance(function_data, dict):
+                parameters = function_data.get("parameters")
+                if isinstance(parameters, dict):
+                    function_data["parameters"] = self._migrate_json_schema(parameters)
+            prepared.append(normalized)
+        return prepared
+
+    def _migrate_json_schema(self, node: object) -> object:
+        if isinstance(node, dict):
+            updated = {key: self._migrate_json_schema(value) for key, value in node.items()}
+
+            for key in NUMERIC_SCHEMA_KEYS:
+                value = updated.get(key)
+                if isinstance(value, bool):
+                    updated.pop(key, None)
+
+            exclusive_minimum = updated.get("exclusiveMinimum")
+            minimum = updated.get("minimum")
+            if isinstance(exclusive_minimum, bool):
+                if exclusive_minimum and self._is_json_number(minimum):
+                    updated["exclusiveMinimum"] = minimum
+                    updated.pop("minimum", None)
+                else:
+                    updated.pop("exclusiveMinimum", None)
+
+            exclusive_maximum = updated.get("exclusiveMaximum")
+            maximum = updated.get("maximum")
+            if isinstance(exclusive_maximum, bool):
+                if exclusive_maximum and self._is_json_number(maximum):
+                    updated["exclusiveMaximum"] = maximum
+                    updated.pop("maximum", None)
+                else:
+                    updated.pop("exclusiveMaximum", None)
+
+            return updated
+
+        if isinstance(node, list):
+            return [self._migrate_json_schema(item) for item in node]
+
+        return node
+
+    def _is_json_number(self, value: object) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    def _is_invalid_tool_schema_error(self, exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "invalid_function_parameters" in text or "invalid schema for function" in text
+
+    def _drop_incompatible_tool(self, definitions: list[dict], exc: Exception) -> list[dict] | None:
+        message = str(exc)
+        name_match = INVALID_FUNCTION_NAME_PATTERN.search(message)
+        if name_match:
+            bad_name = name_match.group(1)
+            reduced = [
+                tool
+                for tool in definitions
+                if isinstance(tool.get("function"), dict)
+                and tool["function"].get("name") != bad_name
+            ]
+            if len(reduced) < len(definitions):
+                return reduced
+
+        index_match = INVALID_TOOL_INDEX_PATTERN.search(message)
+        if index_match:
+            index = int(index_match.group(1))
+            if 0 <= index < len(definitions):
+                return [tool for i, tool in enumerate(definitions) if i != index]
+
+        return None
 
 
 async def list_openai_models(

@@ -8,6 +8,7 @@ import unittest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from assistant_cli.approval import ApprovalManager
+from assistant_cli.llm_client import OpenAILLMClient, OpenAILLMConfig
 from assistant_cli.mcp_manager import MCPManager
 from assistant_cli.memory_store import SQLiteMemoryStore
 
@@ -93,6 +94,60 @@ class MCPManagerTests(unittest.TestCase):
             removed = manager.remove_filesystem_allowed_directory(str(extra))
             self.assertEqual(removed, added)
             self.assertEqual(len(manager.list_filesystem_allowed_directories()), 1)
+
+
+class OpenAIToolSchemaTests(unittest.TestCase):
+    def test_migrate_legacy_json_schema_bounds(self) -> None:
+        client = OpenAILLMClient(OpenAILLMConfig(api_key="test", model="gpt-5.2"))
+        schema = {
+            "type": "object",
+            "properties": {
+                "score": {
+                    "type": "number",
+                    "minimum": 0,
+                    "exclusiveMinimum": True,
+                },
+                "limit": {
+                    "type": "number",
+                    "maximum": 10,
+                    "exclusiveMaximum": True,
+                },
+                "items": {
+                    "type": "array",
+                    "minItems": True,
+                },
+            },
+        }
+
+        migrated = client._migrate_json_schema(schema)
+        self.assertEqual(migrated["properties"]["score"]["exclusiveMinimum"], 0)
+        self.assertNotIn("minimum", migrated["properties"]["score"])
+        self.assertEqual(migrated["properties"]["limit"]["exclusiveMaximum"], 10)
+        self.assertNotIn("maximum", migrated["properties"]["limit"])
+        self.assertNotIn("minItems", migrated["properties"]["items"])
+
+    def test_drop_incompatible_tool_by_name_or_index(self) -> None:
+        client = OpenAILLMClient(OpenAILLMConfig(api_key="test", model="gpt-5.2"))
+        definitions = [
+            {"type": "function", "function": {"name": "alpha", "parameters": {}}},
+            {"type": "function", "function": {"name": "read_pdf", "parameters": {}}},
+            {"type": "function", "function": {"name": "gamma", "parameters": {}}},
+        ]
+
+        by_name = client._drop_incompatible_tool(
+            definitions,
+            RuntimeError('Invalid schema for function "read_pdf": True is not of type "number"'),
+        )
+        self.assertEqual([item["function"]["name"] for item in by_name or []], ["alpha", "gamma"])
+
+        many = [{"type": "function", "function": {"name": f"t{i}", "parameters": {}}} for i in range(30)]
+        by_index = client._drop_incompatible_tool(
+            many,
+            RuntimeError("Invalid schema at tools[26].function.parameters"),
+        )
+        self.assertIsNotNone(by_index)
+        self.assertEqual(len(by_index or []), 29)
+        self.assertNotIn("t26", [item["function"]["name"] for item in by_index or []])
 
 
 if __name__ == "__main__":
