@@ -76,6 +76,22 @@ If install fails with an `mcp` resolver conflict:
    pip install -r requirements.txt
    ```
 
+## MCP connection troubleshooting
+
+If `/mcp` shows `connected=False`:
+
+1. Ensure npm registry access works:
+   ```bash
+   npm ping
+   ```
+2. If npm prints `Access token expired or revoked`, refresh auth:
+   ```bash
+   npm logout
+   npm login
+   ```
+3. The fetch server package should be `mcp-server-fetch` (not `@modelcontextprotocol/server-fetch`).
+4. For `web_search`, export `BRAVE_API_KEY` before launching the app.
+
 ## Environment variables
 
 ```bash

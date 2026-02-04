@@ -8,7 +8,7 @@
   "fetch": {
     "transport": "stdio",
     "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-fetch"],
+    "args": ["-y", "mcp-server-fetch"],
     "enabled": true
   },
   "web_search": {
