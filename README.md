@@ -146,11 +146,17 @@ Example server definitions include:
 - `fetch`
 - `web_search`
 - `memory`
+- `pdf_reader`
+- `playwright`
 - `sequential_thinking`
 
 Each server has `enabled` and transport settings. You can toggle at runtime:
 - `/mcp on <server>`
 - `/mcp off <server>`
+
+Notes:
+- `pdf_reader` uses `@sylphlab/pdf-reader-mcp` for PDF extraction.
+- `playwright` uses `@playwright/mcp` for browser automation workflows.
 
 ### Filesystem allowed paths
 

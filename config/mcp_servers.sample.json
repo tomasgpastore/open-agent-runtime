@@ -26,6 +26,18 @@
     "args": ["-y", "@modelcontextprotocol/server-memory"],
     "enabled": true
   },
+  "pdf_reader": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@sylphlab/pdf-reader-mcp"],
+    "enabled": true
+  },
+  "playwright": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@playwright/mcp@latest"],
+    "enabled": true
+  },
   "sequential_thinking": {
     "transport": "stdio",
     "command": "npx",
