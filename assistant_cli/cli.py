@@ -19,6 +19,37 @@ from assistant_cli.settings import load_settings
 LOGGER = logging.getLogger(__name__)
 
 
+class ResponseStreamPrinter:
+    def __init__(self) -> None:
+        self._line_open = False
+        self._saw_token = False
+
+    def on_token(self, token: str) -> None:
+        if not token:
+            return
+        if not self._line_open:
+            print("assistant> ", end="", flush=True)
+            self._line_open = True
+        print(token, end="", flush=True)
+        self._saw_token = True
+
+    def on_tool(self, tool_name: str) -> None:
+        self._close_line_if_needed()
+        print(f"tool> {tool_name}")
+
+    def finish(self) -> None:
+        self._close_line_if_needed()
+
+    @property
+    def saw_token(self) -> bool:
+        return self._saw_token
+
+    def _close_line_if_needed(self) -> None:
+        if self._line_open:
+            print()
+            self._line_open = False
+
+
 class AssistantCLI:
     def __init__(self) -> None:
         self.settings = load_settings()
@@ -83,6 +114,7 @@ class AssistantCLI:
         initial_messages, pre_truncation = self.memory_store.enforce_token_limit(
             [*history, HumanMessage(content=user_input)]
         )
+        streamer = ResponseStreamPrinter()
 
         tool_map = {tool.name: tool for tool in self.mcp_manager.active_tools()}
 
@@ -91,12 +123,16 @@ class AssistantCLI:
                 messages=initial_messages,
                 tools=tool_map,
                 approval_manager=self.approval_manager,
+                stream_callback=streamer.on_token,
+                tool_event_callback=streamer.on_tool,
             )
         except TimeoutError:
+            streamer.finish()
             print("Assistant request timed out.")
             self.memory_store.save_messages(initial_messages, truncation_occurred=pre_truncation)
             return
         except Exception as exc:  # noqa: BLE001
+            streamer.finish()
             LOGGER.exception("Agent run failed")
             print(f"Assistant error: {exc}")
             self.memory_store.save_messages(initial_messages, truncation_occurred=pre_truncation)
@@ -109,9 +145,12 @@ class AssistantCLI:
         )
 
         if result.stop_reason == "tool_rejected":
+            streamer.finish()
             return
 
-        print(f"assistant> {result.final_answer}")
+        streamer.finish()
+        if not streamer.saw_token:
+            print(f"assistant> {result.final_answer}")
 
     async def _handle_command(self, command_line: str) -> bool:
         parts = command_line.strip().split()

@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import platform
 import uuid
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Callable, TypedDict
@@ -22,15 +24,19 @@ from assistant_cli.llm_client import LLMCallError, OllamaLLMClient
 LOGGER = logging.getLogger(__name__)
 
 
-SYSTEM_PROMPT = (
-    "You are a pragmatic personal assistant. "
-    "Use tools when needed, including multiple tools in sequence for complex tasks. "
-    "Avoid unnecessary tool calls. "
-    "If a task is multi-step or may exceed context limits, use memory tools to write durable checkpoints "
-    "(plans, constraints, intermediate results) and retrieve them before continuing. "
-    "Do not assume long-term memory is in context unless explicitly retrieved. "
-    "Return concise final answers and never expose hidden reasoning."
-)
+def _build_system_prompt() -> str:
+    now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    os_info = platform.platform()
+    return (
+        "You are a pragmatic personal assistant. "
+        "Use tools when needed, including multiple tools in sequence for complex tasks. "
+        "Avoid unnecessary tool calls. "
+        "If a task is multi-step or may exceed context limits, use memory tools to write durable checkpoints "
+        "(plans, constraints, intermediate results) and retrieve them before continuing. "
+        "Do not assume long-term memory is in context unless explicitly retrieved. "
+        "Return concise final answers and never expose hidden reasoning. "
+        f"Runtime context: current_time={now}; os={os_info}."
+    )
 
 
 class AgentState(TypedDict):
@@ -122,10 +128,17 @@ class LangGraphAgent:
             }
 
         tools = list(config["configurable"]["tools"].values())
-        messages = [SystemMessage(content=SYSTEM_PROMPT), *state["messages"]]
+        stream_callback: Callable[[str], None] | None = config["configurable"].get(
+            "stream_callback"
+        )
+        messages = [SystemMessage(content=_build_system_prompt()), *state["messages"]]
 
         try:
-            response = await self._llm_client.invoke(messages, tools=tools)
+            response = await self._llm_client.invoke(
+                messages,
+                tools=tools,
+                on_token=stream_callback,
+            )
             return {
                 "messages": [response],
                 "iteration": iteration + 1,
@@ -145,6 +158,9 @@ class LangGraphAgent:
         tools: dict[str, BaseTool] = config["configurable"]["tools"]
         approval_manager: ApprovalManager = config["configurable"]["approval_manager"]
         input_fn: Callable[[str], str] = config["configurable"].get("input_fn", input)
+        tool_event_callback: Callable[[str], None] | None = config["configurable"].get(
+            "tool_event_callback"
+        )
 
         last_ai_message = self._last_ai_message(state["messages"])
         if last_ai_message is None:
@@ -160,6 +176,11 @@ class LangGraphAgent:
             tool_name = call["name"]
             tool_args = call.get("args") or {}
             tool_call_id = call.get("id") or str(uuid.uuid4())
+            if tool_event_callback:
+                try:
+                    tool_event_callback(tool_name)
+                except Exception:  # noqa: BLE001
+                    LOGGER.exception("Tool event callback failed")
 
             tool = tools.get(tool_name)
             if tool is None:
@@ -243,6 +264,8 @@ class LangGraphAgent:
         tools: dict[str, BaseTool],
         approval_manager: ApprovalManager,
         input_fn: Callable[[str], str] = input,
+        stream_callback: Callable[[str], None] | None = None,
+        tool_event_callback: Callable[[str], None] | None = None,
     ) -> AgentRunResult:
         await self._ensure_graph()
         thread_id = f"request-{uuid.uuid4()}"
@@ -252,6 +275,8 @@ class LangGraphAgent:
                 "tools": tools,
                 "approval_manager": approval_manager,
                 "input_fn": input_fn,
+                "stream_callback": stream_callback,
+                "tool_event_callback": tool_event_callback,
                 "max_iterations": self._max_iterations,
                 "tool_timeout_seconds": self._tool_timeout_seconds,
             }
