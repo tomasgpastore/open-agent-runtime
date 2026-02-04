@@ -23,6 +23,7 @@ from assistant_cli.llm_client import LLMCallError, LLMClient, LLMToolUnsupported
 
 
 LOGGER = logging.getLogger(__name__)
+MAX_IDENTICAL_TOOL_CALLS_PER_TURN = 3
 
 
 def _build_system_prompt() -> str:
@@ -32,6 +33,7 @@ def _build_system_prompt() -> str:
         "You are a pragmatic personal assistant. "
         "Use tools when needed, including multiple tools in sequence for complex tasks. "
         "Avoid unnecessary tool calls. "
+        "Do not repeat an identical tool call with the same arguments unless a transient error occurred. "
         "If a task is multi-step or may exceed context limits, use memory tools to write durable checkpoints "
         "(plans, constraints, intermediate results) and retrieve them before continuing. "
         "Do not assume long-term memory is in context unless explicitly retrieved. "
@@ -262,6 +264,22 @@ class LangGraphAgent:
             raw_tool_args = call.get("args") or {}
             tool_args = deepcopy(raw_tool_args)
             tool_call_id = call.get("id") or str(uuid.uuid4())
+            repeated_count = self._count_tool_call_occurrences_current_turn(
+                state["messages"], tool_name, tool_args
+            )
+            if repeated_count > MAX_IDENTICAL_TOOL_CALLS_PER_TURN:
+                return {
+                    "stop_reason": "tool_loop_detected",
+                    "messages": [
+                        AIMessage(
+                            content=(
+                                f"I detected a tool loop: `{tool_name}` was called with the same arguments "
+                                f"{repeated_count} times in this turn. I stopped to avoid wasting cycles. "
+                                "Please refine the request or run it again."
+                            )
+                        )
+                    ],
+                }
             if tool_event_callback:
                 try:
                     tool_event_callback(tool_name)
@@ -445,3 +463,44 @@ class LangGraphAgent:
             if isinstance(message, ToolMessage):
                 return True
         return False
+
+    def _count_tool_call_occurrences_current_turn(
+        self,
+        messages: list[BaseMessage],
+        tool_name: str,
+        tool_args: object,
+    ) -> int:
+        signature = self._tool_call_signature(tool_name, tool_args)
+        count = 0
+        for message in self._messages_in_current_turn(messages):
+            if not isinstance(message, AIMessage) or not message.tool_calls:
+                continue
+            for call in message.tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                if call.get("name") != tool_name:
+                    continue
+                call_args = call.get("args") or {}
+                if self._tool_call_signature(tool_name, call_args) == signature:
+                    count += 1
+        return count
+
+    def _messages_in_current_turn(self, messages: list[BaseMessage]) -> list[BaseMessage]:
+        recent: list[BaseMessage] = []
+        seen_latest_user = False
+        for message in reversed(messages):
+            recent.append(message)
+            if isinstance(message, HumanMessage):
+                seen_latest_user = True
+                break
+        if not seen_latest_user:
+            return list(messages)
+        recent.reverse()
+        return recent
+
+    def _tool_call_signature(self, tool_name: str, tool_args: object) -> str:
+        try:
+            payload = json.dumps(tool_args, sort_keys=True, ensure_ascii=False)
+        except TypeError:
+            payload = str(tool_args)
+        return f"{tool_name}:{payload}"

@@ -20,9 +20,9 @@ class AppSettings:
     openai_base_url: str = DEFAULT_OPENAI_BASE_URL
     openai_model: str = DEFAULT_OPENAI_MODEL
     ollama_temperature: float = 0.1
-    model_context_window: int = 8000
-    short_term_token_limit: int = 3000
-    max_iterations: int = 10
+    model_context_window: int = 20000
+    short_term_token_limit: int = 20000
+    max_iterations: int = 100
     request_timeout_seconds: int = 120
     llm_request_timeout_seconds: int = 90
     llm_retry_attempts: int = 3
@@ -72,9 +72,9 @@ def load_settings() -> AppSettings:
         openai_base_url=os.getenv("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
         openai_model=os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
         ollama_temperature=_get_float("OLLAMA_TEMPERATURE", 0.1),
-        model_context_window=_get_int("MODEL_CONTEXT_WINDOW", 8000),
-        short_term_token_limit=_get_int("SHORT_TERM_TOKEN_LIMIT", 3000),
-        max_iterations=_get_int("MAX_ITERATIONS", 10),
+        model_context_window=_get_int("MODEL_CONTEXT_WINDOW", 20000),
+        short_term_token_limit=_get_int("SHORT_TERM_TOKEN_LIMIT", 20000),
+        max_iterations=_get_int("MAX_ITERATIONS", 100),
         request_timeout_seconds=_get_int("REQUEST_TIMEOUT_SECONDS", 120),
         llm_request_timeout_seconds=_get_int("LLM_REQUEST_TIMEOUT_SECONDS", 90),
         llm_retry_attempts=_get_int("LLM_RETRY_ATTEMPTS", 3),

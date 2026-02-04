@@ -6,7 +6,10 @@ import json
 import unittest
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import BaseMessage
+from langchain_core.tools import BaseTool
 
+from assistant_cli.agent_graph import LangGraphAgent
 from assistant_cli.approval import ApprovalManager
 from assistant_cli.llm_client import OpenAILLMClient, OpenAILLMConfig
 from assistant_cli.mcp_manager import MCPManager
@@ -148,6 +151,57 @@ class OpenAIToolSchemaTests(unittest.TestCase):
         self.assertIsNotNone(by_index)
         self.assertEqual(len(by_index or []), 29)
         self.assertNotIn("t26", [item["function"]["name"] for item in by_index or []])
+
+
+class _DummyLLMClient:
+    @property
+    def model_name(self) -> str:
+        return "dummy"
+
+    async def invoke(  # pragma: no cover - helper for construction only
+        self,
+        messages: list[BaseMessage],
+        tools: list[BaseTool] | None = None,
+        on_token=None,
+    ) -> AIMessage:
+        return AIMessage(content="ok")
+
+
+class ToolLoopGuardTests(unittest.TestCase):
+    def test_tool_call_count_scoped_to_latest_turn(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            agent = LangGraphAgent(
+                db_path=Path(tmp_dir) / "graph.db",
+                llm_client=_DummyLLMClient(),
+                max_iterations=10,
+                request_timeout_seconds=30,
+                tool_timeout_seconds=5,
+            )
+
+            messages = [
+                HumanMessage(content="old turn"),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"id": "old-1", "name": "read_pdf", "args": {"path": "a.pdf", "page": 1}}
+                    ],
+                ),
+                ToolMessage(content="old result", tool_call_id="old-1"),
+                HumanMessage(content="new turn"),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"id": "new-1", "name": "read_pdf", "args": {"path": "a.pdf", "page": 1}}
+                    ],
+                ),
+            ]
+
+            count = agent._count_tool_call_occurrences_current_turn(
+                messages,
+                "read_pdf",
+                {"path": "a.pdf", "page": 1},
+            )
+            self.assertEqual(count, 1)
 
 
 if __name__ == "__main__":

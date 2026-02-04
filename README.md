@@ -24,9 +24,10 @@ Production-quality Python CLI personal assistant using:
 - Rich rendering for structured output (panels/tables/status views)
 - Dynamic MCP server enable/disable at runtime.
 - Per-tool and global approval gates before tool execution.
-- Multi-step agent loop with up to 10 tool-iteration cycles by default.
-- Rolling short-term memory budget (3000 token estimate).
-- 8k context target with explicit budget reporting.
+- Multi-step agent loop with up to 100 tool-iteration cycles by default.
+- Rolling short-term memory budget (20,000 token estimate).
+- 20k context target with explicit budget reporting.
+- Guard against repeated identical tool-call loops in a single turn.
 - Optional long-term memory wipe via MCP memory tools on `/new`.
 
 ## Project structure
@@ -116,9 +117,9 @@ export OPENAI_API_KEY="..."
 
 # Optional tuning
 export OLLAMA_TEMPERATURE="0.1"
-export SHORT_TERM_TOKEN_LIMIT="3000"
-export MODEL_CONTEXT_WINDOW="8000"
-export MAX_ITERATIONS="10"
+export SHORT_TERM_TOKEN_LIMIT="20000"
+export MODEL_CONTEXT_WINDOW="20000"
+export MAX_ITERATIONS="100"
 export REQUEST_TIMEOUT_SECONDS="120"
 export MCP_CONFIG_PATH="config/mcp_servers.json"
 export ASSISTANT_SQLITE_PATH="data/assistant.db"
@@ -197,12 +198,12 @@ Note: `Cmd+Arrow` usually does not reach terminal apps on macOS unless remapped 
 
 - Stored in SQLite table `conversation_state` inside `data/assistant.db` by default.
 - Token estimate heuristic: serialized char length / 4.
-- Rolling cap: **3000** estimated tokens.
+- Rolling cap: **20,000** estimated tokens.
 - On overflow, oldest messages are truncated first.
 - `/memory` prints:
   - estimated tokens in memory
-  - token limit (3000)
-  - model context target (8000)
+  - token limit (20,000)
+  - model context target (20,000)
   - recent turns kept
   - whether truncation happened in the last turn
 
@@ -225,7 +226,7 @@ LangGraph loop executes:
 Stop conditions:
 - model returns final answer (no tool calls)
 - tool call is rejected by user
-- max iterations reached (default 10)
+- max iterations reached (default 100)
 - hard request timeout
 
 ## Approval mode
