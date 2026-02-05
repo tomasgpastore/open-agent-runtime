@@ -22,6 +22,12 @@ Production-quality Python CLI personal assistant using:
   - multiline compose
   - slash command autocomplete/filtering
   - line editing with arrow keys/history
+- Textual TUI (default):
+  - header/status bar
+  - scrollable message history
+  - streaming assistant output
+  - tool cards with toggles (Ctrl+O)
+  - multiline input
 - Rich rendering for structured output (panels/tables/status views)
 - Dynamic MCP server enable/disable at runtime.
 - Per-tool and global approval gates before tool execution.
@@ -142,6 +148,16 @@ OpenAI usage requires API credentials and API billing. A ChatGPT app subscriptio
 
 ```bash
 python main.py
+```
+
+To force the classic prompt-toolkit CLI:
+```bash
+ASSISTANT_UI=classic python main.py
+```
+
+You can also use:
+```bash
+python main.py --classic
 ```
 
 ## MCP configuration
