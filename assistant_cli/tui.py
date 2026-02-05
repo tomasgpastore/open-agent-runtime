@@ -17,7 +17,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Static, TextArea
+from textual.widgets import Button, Static, TextArea
 
 from assistant_cli.agent_graph import LangGraphAgent
 from assistant_cli.approval import ApprovalManager
@@ -34,6 +34,7 @@ from assistant_cli.mcp_manager import MCPManager
 from assistant_cli.memory_store import SQLiteMemoryStore
 from assistant_cli.memory_tools import wipe_memory_graph
 from assistant_cli.settings import load_settings
+from assistant_cli.skills_manager import SkillManager
 
 
 class InputSubmitted(Message):
@@ -43,7 +44,22 @@ class InputSubmitted(Message):
 
 
 class ChatInput(TextArea):
-    pass
+    async def _on_key(self, event: events.Key) -> None:  # type: ignore[override]
+        if event.key == "enter" and not event.shift:
+            event.stop()
+            event.prevent_default()
+            value = self.text.strip()
+            if value:
+                self.post_message(InputSubmitted(value))
+                self.text = ""
+            return
+        if event.key in {"shift+enter"} or (event.key == "enter" and event.shift):
+            event.stop()
+            event.prevent_default()
+            start, end = self.selection
+            self._replace_via_keyboard("\n", start, end)
+            return
+        await super()._on_key(event)
 
 
 class MessageBubble(Static):
@@ -137,16 +153,22 @@ class AssistantTUI(App):
     CSS = """
     Screen {
         layout: vertical;
+        background: transparent;
     }
 
     #header {
         padding: 1 2;
-        background: $panel;
+        background: transparent;
     }
 
     #message-area {
         height: 1fr;
         padding: 1 2;
+        background: transparent;
+        border-top: solid $primary;
+        border-bottom: solid $primary;
+        border-left: none;
+        border-right: none;
     }
 
     MessageBubble.role-user {
@@ -162,12 +184,17 @@ class AssistantTUI(App):
     }
 
     #input-area {
-        height: 6;
-        padding: 0 2 1 2;
+        height: 5;
+        padding: 0 2 0 2;
+        background: transparent;
+        border: none;
     }
 
     #footer {
-        padding: 0 2 1 2;
+        height: 1;
+        padding: 0 2;
+        background: transparent;
+        border-top: solid $primary;
     }
 
     #approval-dialog {
@@ -203,6 +230,11 @@ class AssistantTUI(App):
             config_path=self.settings.mcp_config_path,
             fallback_config_path=self.settings.mcp_fallback_config_path,
         )
+        self.skill_manager = SkillManager(
+            skill_dirs=self.settings.skill_dirs,
+            max_per_turn=self.settings.skill_max_per_turn,
+            max_chars=self.settings.skill_max_chars,
+        )
 
         self.agent = LangGraphAgent(
             db_path=self.settings.sqlite_path,
@@ -210,6 +242,7 @@ class AssistantTUI(App):
             max_iterations=self.settings.max_iterations,
             request_timeout_seconds=self.settings.request_timeout_seconds,
             tool_timeout_seconds=self.settings.tool_timeout_seconds,
+            skill_manager=self.skill_manager,
         )
 
         self._current_tool_cards: list[ToolCard] = []
@@ -218,12 +251,13 @@ class AssistantTUI(App):
         yield Static(id="header")
         yield ScrollableContainer(id="message-area")
         yield ChatInput(id="input-area")
-        yield Footer(id="footer")
+        yield Static("Ctrl+C quit · Ctrl+O toggle tools · Ctrl+R new", id="footer")
 
     async def on_mount(self) -> None:
         await self._safe_refresh_mcp("startup")
         self._render_header()
         self.query_one(ChatInput).focus()
+        self.query_one("#message-area", ScrollableContainer).can_focus = False
 
     async def on_key(self, event: events.Key) -> None:  # type: ignore[override]
         if (
@@ -237,6 +271,7 @@ class AssistantTUI(App):
             if value:
                 self.post_message(InputSubmitted(value))
                 self.query_one(ChatInput).text = ""
+                self.query_one(ChatInput).focus()
             return
         return
 
@@ -386,7 +421,7 @@ class AssistantTUI(App):
             return
 
         if command == "/skills":
-            self._handle_skills_command()
+            self._handle_skills_command(parts[1:])
             return
 
         if command == "/paths":
@@ -490,26 +525,82 @@ class AssistantTUI(App):
         self._post_system_message(Panel.fit(body, title="Short-term Memory", border_style="blue"))
 
     def _handle_skills_command(self) -> None:
-        table = Table(title="Anton Skills & Capabilities")
-        table.add_column("Area", style="bold")
-        table.add_column("Details")
-        table.add_row(
-            "LLM Providers",
-            f"local (Ollama), openai, openrouter (current: {self.current_provider})",
+        self._handle_skills_command([])
+
+    def _handle_skills_command(self, args: list[str]) -> None:
+        if not args or args[0].lower() == "list":
+            self._print_skills_summary()
+            self._print_skills_list()
+            return
+
+        action = args[0].lower()
+        if action == "refresh":
+            self.skill_manager.refresh()
+            self._post_system_message("Skills refreshed.")
+            errors = self.skill_manager.refresh_errors()
+            if errors:
+                self._post_system_message("\n".join(["Some skills could not be loaded:", *errors]))
+            self._print_skills_summary()
+            self._print_skills_list()
+            return
+
+        if action == "show":
+            if len(args) < 2:
+                self._post_system_message("Usage: /skills show <name>")
+                return
+            query = " ".join(args[1:]).strip()
+            skill = self.skill_manager.get_skill(query)
+            if not skill:
+                self._post_system_message(f"No skill found for '{query}'.")
+                return
+            panel = Panel.fit(
+                skill.content.strip(),
+                title=f"Skill: {skill.metadata.name}",
+                border_style="blue",
+            )
+            self._post_system_message(panel)
+            return
+
+        if action == "paths":
+            self._print_skill_paths()
+            return
+
+        self._post_system_message(
+            "Usage: /skills | /skills list | /skills refresh | /skills show <name> | /skills paths"
         )
+        return
+
+    def _print_skills_summary(self) -> None:
+        table = Table(title="Skill Configuration")
+        table.add_column("Setting", style="bold")
+        table.add_column("Value")
         table.add_row(
-            "Memory",
-            f"short-term: {self.settings.short_term_token_limit} tokens; "
-            f"context target: {self.settings.model_context_window}",
+            "Skill dirs",
+            ", ".join(str(path) for path in self.skill_manager.list_skill_dirs()) or "(none)",
         )
-        table.add_row(
-            "Tools",
-            ", ".join(self.mcp_manager.tool_names()) or "(none)",
-        )
-        table.add_row(
-            "Filesystem Access",
-            ", ".join(self.mcp_manager.list_filesystem_allowed_directories()) or "(none)",
-        )
+        table.add_row("Max skills per turn", str(self.settings.skill_max_per_turn))
+        table.add_row("Max skill chars", str(self.settings.skill_max_chars))
+        table.add_row("Discovered skills", str(len(self.skill_manager.list_skills())))
+        self._post_system_message(table)
+
+    def _print_skills_list(self) -> None:
+        skills = self.skill_manager.list_skills()
+        table = Table(title="Available Skills")
+        table.add_column("Name", style="bold")
+        table.add_column("Description")
+        table.add_column("Location")
+        if not skills:
+            table.add_row("(none)", "", "")
+        else:
+            for skill in skills:
+                table.add_row(skill.name, skill.description, str(skill.skill_md_path))
+        self._post_system_message(table)
+
+    def _print_skill_paths(self) -> None:
+        table = Table(title="Skill Paths")
+        table.add_column("Path", style="bold")
+        for path in self.skill_manager.list_skill_dirs():
+            table.add_row(str(path))
         self._post_system_message(table)
 
     async def _handle_paths_command(self, args: list[str]) -> None:
