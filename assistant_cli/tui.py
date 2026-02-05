@@ -45,7 +45,7 @@ class InputSubmitted(Message):
 
 class ChatInput(TextArea):
     async def _on_key(self, event: events.Key) -> None:  # type: ignore[override]
-        if event.key == "enter" and not event.shift:
+        if event.key == "enter":
             event.stop()
             event.prevent_default()
             value = self.text.strip()
@@ -53,7 +53,7 @@ class ChatInput(TextArea):
                 self.post_message(InputSubmitted(value))
                 self.text = ""
             return
-        if event.key in {"shift+enter"} or (event.key == "enter" and event.shift):
+        if event.key == "shift+enter":
             event.stop()
             event.prevent_default()
             start, end = self.selection
@@ -260,20 +260,20 @@ class AssistantTUI(App):
         self.query_one("#message-area", ScrollableContainer).can_focus = False
 
     async def on_key(self, event: events.Key) -> None:  # type: ignore[override]
-        if (
-            event.key == "enter"
-            and not event.shift
-            and self.query_one(ChatInput).has_focus
-        ):
-            event.prevent_default()
-            event.stop()
-            value = self.query_one(ChatInput).text.strip()
-            if value:
-                self.post_message(InputSubmitted(value))
-                self.query_one(ChatInput).text = ""
-                self.query_one(ChatInput).focus()
+        if event.key != "enter":
             return
-        return
+
+        chat_input = self.query_one(ChatInput)
+        if chat_input.has_focus:
+            return
+
+        event.prevent_default()
+        event.stop()
+        value = chat_input.text.strip()
+        if value:
+            self.post_message(InputSubmitted(value))
+            chat_input.text = ""
+        chat_input.focus()
 
     async def _safe_refresh_mcp(self, reason: str) -> None:
         try:
