@@ -9,7 +9,7 @@ from copy import deepcopy
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Callable, TypedDict
+from typing import Annotated, Awaitable, Callable, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -263,6 +263,9 @@ class LangGraphAgent:
         tool_event_callback: Callable[[str], None] | None = config["configurable"].get(
             "tool_event_callback"
         )
+        approval_prompt: Callable[[str, dict], Awaitable[bool]] | None = config["configurable"].get(
+            "approval_prompt"
+        )
 
         last_ai_message = self._last_ai_message(state["messages"])
         if last_ai_message is None:
@@ -315,6 +318,7 @@ class LangGraphAgent:
                 tool_name=tool_name,
                 payload=tool_args,
                 input_fn=input_fn,
+                approval_prompt=approval_prompt,
             )
             if not approved:
                 return {
@@ -385,6 +389,7 @@ class LangGraphAgent:
         input_fn: Callable[[str], str] = input,
         stream_callback: Callable[[str], None] | None = None,
         tool_event_callback: Callable[[str], None] | None = None,
+        approval_prompt: Callable[[str, dict], Awaitable[bool]] | None = None,
     ) -> AgentRunResult:
         await self._ensure_graph()
         thread_id = f"request-{uuid.uuid4()}"
@@ -396,6 +401,7 @@ class LangGraphAgent:
                 "input_fn": input_fn,
                 "stream_callback": stream_callback,
                 "tool_event_callback": tool_event_callback,
+                "approval_prompt": approval_prompt,
                 "max_iterations": self._max_iterations,
                 "tool_timeout_seconds": self._tool_timeout_seconds,
             }

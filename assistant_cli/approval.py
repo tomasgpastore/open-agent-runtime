@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Awaitable, Callable, Sequence
 
 
 @dataclass(slots=True)
@@ -42,9 +42,13 @@ class ApprovalManager:
         tool_name: str,
         payload: dict,
         input_fn: Callable[[str], str] = input,
+        approval_prompt: Callable[[str, dict], Awaitable[bool]] | None = None,
     ) -> bool:
         if not self.tool_enabled(tool_name):
             return True
+
+        if approval_prompt is not None:
+            return bool(await approval_prompt(tool_name, payload))
 
         print(f"\nTool: {tool_name}")
         print("Arguments:")
