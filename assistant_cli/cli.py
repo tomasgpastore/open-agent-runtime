@@ -455,6 +455,10 @@ class AssistantCLI:
             self._handle_memory_command()
             return False
 
+        if command == "/skills":
+            self._handle_skills_command()
+            return False
+
         if command == "/paths":
             await self._handle_paths_command(parts[1:])
             return False
@@ -658,6 +662,29 @@ class AssistantCLI:
         )
         self.console.print(Panel.fit(body, title="Short-term Memory", border_style="blue"))
 
+    def _handle_skills_command(self) -> None:
+        table = Table(title="Anton Skills & Capabilities")
+        table.add_column("Area", style="bold")
+        table.add_column("Details")
+        table.add_row(
+            "LLM Providers",
+            f"local (Ollama), openai, openrouter (current: {self.current_provider})",
+        )
+        table.add_row(
+            "Memory",
+            f"short-term: {self.settings.short_term_token_limit} tokens; "
+            f"context target: {self.settings.model_context_window}",
+        )
+        table.add_row(
+            "Tools",
+            ", ".join(self.mcp_manager.tool_names()) or "(none)",
+        )
+        table.add_row(
+            "Filesystem Access",
+            ", ".join(self.mcp_manager.list_filesystem_allowed_directories()) or "(none)",
+        )
+        self.console.print(table)
+
     async def _handle_llm_command(self, args: Sequence[str]) -> None:
         if not args:
             self.console.print(f"Current provider: {self.current_provider}", style="bold")
@@ -833,6 +860,7 @@ class AssistantCLI:
         table.add_row("/approval global on|off", "Toggle global approval")
         table.add_row("/approval tool <tool> on|off", "Toggle approval for one tool")
         table.add_row("/memory", "Show short-term memory stats")
+        table.add_row("/skills", "Show Anton's capabilities")
         table.add_row("/paths", "List filesystem allowed paths")
         table.add_row("/paths add <path>", "Allow filesystem access to a path")
         table.add_row("/paths remove <path>", "Remove an allowed filesystem path")
@@ -858,6 +886,7 @@ class AssistantCLI:
             "/mcp",
             "/approval",
             "/memory",
+            "/skills",
             "/paths",
             "/llm",
             "/new",
@@ -874,6 +903,8 @@ class AssistantCLI:
             return ["list", "add <path>", "add downloads", "add desktop", "add documents", "remove <path>"]
         if root_command == "/llm":
             return ["local <model>", "openai <model>", "openrouter <model>"]
+        if root_command == "/skills":
+            return []
         return []
 
     def _parse_on_off(self, value: str) -> bool | None:

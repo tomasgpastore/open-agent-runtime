@@ -13,6 +13,7 @@ Production-quality Python CLI personal assistant using:
   - `/mcp`
   - `/approval`
   - `/memory`
+  - `/skills`
   - `/paths`
   - `/llm`
   - `/new`
@@ -212,6 +213,7 @@ Note: `Cmd+Arrow` usually does not reach terminal apps on macOS unless remapped 
   - model context target (20,000)
   - recent turns kept
   - whether truncation happened in the last turn
+- `/skills` shows Anton's current capabilities, providers, and active tool list.
 
 ## Long-term memory behavior
 
