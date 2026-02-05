@@ -251,10 +251,7 @@ class LangGraphAgent:
                 "stop_reason": "llm_error",
                 "messages": [
                     AIMessage(
-                        content=(
-                            "I hit an LLM backend error and couldn't finish this request. "
-                            "Try `/new` to reset the session, or switch model/provider with `/llm`."
-                        )
+                        content=self._format_llm_error_message(exc)
                     )
                 ],
             }
@@ -459,6 +456,25 @@ class LangGraphAgent:
             and any(word in text for word in ("now", "current", "right now", "today", "latest"))
         )
         return explicit_web or live_weather
+
+    def _format_llm_error_message(self, exc: Exception) -> str:
+        text = str(exc)
+        lowered = text.lower()
+        if "openrouter" in lowered or "key limit exceeded" in lowered or "insufficient" in lowered:
+            return (
+                "OpenRouter rejected the request due to key limits or insufficient credits. "
+                "Add credits or raise the key limit at OpenRouter settings, or lower "
+                "OPENROUTER_MAX_COMPLETION_TOKENS. You can also switch providers with `/llm`."
+            )
+        if "quota" in lowered or "billing" in lowered:
+            return (
+                "The LLM provider rejected this request due to quota or billing limits. "
+                "Check your provider account, or switch providers with `/llm`."
+            )
+        return (
+            "I hit an LLM backend error and couldn't finish this request. "
+            "Try `/new` to reset the session, or switch model/provider with `/llm`."
+        )
 
     def _latest_user_message_text(self, messages: list[BaseMessage]) -> str:
         for message in reversed(messages):

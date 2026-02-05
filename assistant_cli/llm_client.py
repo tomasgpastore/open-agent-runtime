@@ -213,8 +213,6 @@ class OpenAILLMClient:
     def __init__(self, config: OpenAILLMConfig) -> None:
         self._config = config
         model_kwargs = dict(config.model_kwargs)
-        if config.max_completion_tokens is not None:
-            model_kwargs.setdefault("max_tokens", config.max_completion_tokens)
         extra_body = dict(config.extra_body) if config.extra_body else {}
         if config.reasoning is not None:
             extra_body.setdefault("reasoning", config.reasoning)
@@ -225,6 +223,7 @@ class OpenAILLMClient:
             temperature=config.temperature,
             timeout=config.timeout_seconds,
             max_retries=0,
+            max_tokens=config.max_completion_tokens,
             default_headers=config.default_headers or None,
             model_kwargs=model_kwargs,
             extra_body=extra_body or None,
