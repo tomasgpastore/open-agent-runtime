@@ -24,22 +24,37 @@ from assistant_cli.llm_client import LLMCallError, LLMClient, LLMToolUnsupported
 
 LOGGER = logging.getLogger(__name__)
 MAX_IDENTICAL_TOOL_CALLS_PER_TURN = 3
+SYSTEM_PROMPT_PATH = Path(__file__).resolve().parents[1] / "anton-0.1.md"
 
 
-def _build_system_prompt() -> str:
+def _build_system_prompt(tool_names: list[str]) -> str:
     now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     os_info = platform.platform()
+    tool_list = ", ".join(sorted(tool_names)) if tool_names else "none"
+    template = _load_system_prompt_template()
     return (
-        "You are a pragmatic personal assistant. "
-        "Use tools when needed, including multiple tools in sequence for complex tasks. "
-        "Avoid unnecessary tool calls. "
-        "Do not repeat an identical tool call with the same arguments unless a transient error occurred. "
-        "If a task is multi-step or may exceed context limits, use memory tools to write durable checkpoints "
-        "(plans, constraints, intermediate results) and retrieve them before continuing. "
-        "Do not assume long-term memory is in context unless explicitly retrieved. "
-        "Return concise final answers and never expose hidden reasoning. "
-        f"Runtime context: current_time={now}; os={os_info}."
+        template.replace("{{currentDateTime}}", now)
+        .replace("{{osInfo}}", os_info)
+        .replace("{{toolList}}", tool_list)
     )
+
+
+def _load_system_prompt_template() -> str:
+    try:
+        return SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return (
+            "You are Anton, a pragmatic personal assistant. "
+            "Use tools when needed, including multiple tools in sequence for complex tasks. "
+            "Avoid unnecessary tool calls. "
+            "Do not repeat an identical tool call with the same arguments unless a transient error occurred. "
+            "If a task is multi-step or may exceed context limits, use memory tools to write durable checkpoints "
+            "(plans, constraints, intermediate results) and retrieve them before continuing. "
+            "Do not assume long-term memory is in context unless explicitly retrieved. "
+            "Return concise final answers and never expose hidden reasoning. "
+            "Runtime context: current_time={{currentDateTime}}; os={{osInfo}}. "
+            "Available tools: {{toolList}}."
+        )
 
 
 TOOL_RETRY_SYSTEM_PROMPT = (
@@ -153,7 +168,10 @@ class LangGraphAgent:
         # Do not stream drafts for turns that must be grounded via tool use.
         if needs_fresh_tool_call:
             stream_callback = None
-        messages = [SystemMessage(content=_build_system_prompt()), *state["messages"]]
+        messages = [
+            SystemMessage(content=_build_system_prompt(tool_names)),
+            *state["messages"],
+        ]
 
         if needs_fresh_tool_call and not self._has_relevant_external_tool(tool_names):
             return {
