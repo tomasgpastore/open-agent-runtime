@@ -20,6 +20,7 @@ from langgraph.graph.message import add_messages
 
 from assistant_cli.approval import ApprovalManager
 from assistant_cli.llm_client import LLMCallError, LLMClient, LLMToolUnsupportedError
+from assistant_cli.skills_manager import SkillManager
 
 
 LOGGER = logging.getLogger(__name__)
@@ -27,16 +28,21 @@ MAX_IDENTICAL_TOOL_CALLS_PER_TURN = 3
 SYSTEM_PROMPT_PATH = Path(__file__).resolve().parents[1] / "anton-0.1.md"
 
 
-def _build_system_prompt(tool_names: list[str]) -> str:
+def _build_system_prompt(tool_names: list[str], skills_prompt: str) -> str:
     now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     os_info = platform.platform()
     tool_list = ", ".join(sorted(tool_names)) if tool_names else "none"
     template = _load_system_prompt_template()
-    return (
+    rendered = (
         template.replace("{{currentDateTime}}", now)
         .replace("{{osInfo}}", os_info)
         .replace("{{toolList}}", tool_list)
     )
+    if "{{skillsList}}" in rendered:
+        return rendered.replace("{{skillsList}}", skills_prompt)
+    if skills_prompt:
+        return f"{rendered}\n\n{skills_prompt}"
+    return rendered
 
 
 def _load_system_prompt_template() -> str:
@@ -86,12 +92,14 @@ class LangGraphAgent:
         max_iterations: int,
         request_timeout_seconds: int,
         tool_timeout_seconds: int,
+        skill_manager: SkillManager | None = None,
     ) -> None:
         self._llm_client = llm_client
         self._max_iterations = max_iterations
         self._request_timeout_seconds = request_timeout_seconds
         self._tool_timeout_seconds = tool_timeout_seconds
         self._db_path = db_path
+        self._skill_manager = skill_manager
 
         self._checkpointer_cm: AsyncSqliteSaver | None = None
         self._checkpointer: AsyncSqliteSaver | None = None
@@ -158,6 +166,12 @@ class LangGraphAgent:
 
         tools = list(config["configurable"]["tools"].values())
         tool_names = [tool.name for tool in tools]
+        skill_manager: SkillManager | None = config["configurable"].get("skill_manager")
+        skills_prompt = skill_manager.available_skills_prompt() if skill_manager else "(none)"
+        latest_user_text = self._latest_user_message_text(state["messages"])
+        activation_prompt = None
+        if skill_manager and latest_user_text:
+            activation_prompt = skill_manager.activation_prompt(latest_user_text)
         requires_tool = self._requires_external_tool(state["messages"])
         needs_fresh_tool_call = requires_tool and not self._has_tool_message_since_latest_user(
             state["messages"]
@@ -168,10 +182,10 @@ class LangGraphAgent:
         # Do not stream drafts for turns that must be grounded via tool use.
         if needs_fresh_tool_call:
             stream_callback = None
-        messages = [
-            SystemMessage(content=_build_system_prompt(tool_names)),
-            *state["messages"],
-        ]
+        messages = [SystemMessage(content=_build_system_prompt(tool_names, skills_prompt))]
+        if activation_prompt:
+            messages.append(SystemMessage(content=activation_prompt))
+        messages.extend(state["messages"])
 
         if needs_fresh_tool_call and not self._has_relevant_external_tool(tool_names):
             return {
@@ -404,6 +418,7 @@ class LangGraphAgent:
                 "approval_prompt": approval_prompt,
                 "max_iterations": self._max_iterations,
                 "tool_timeout_seconds": self._tool_timeout_seconds,
+                "skill_manager": self._skill_manager,
             }
         }
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -13,6 +13,7 @@ DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "moonshotai/kimi-k2.5"
+DEFAULT_SKILL_DIRS = ["skills", "~/.codex/skills"]
 
 
 @dataclass(slots=True)
@@ -38,6 +39,9 @@ class AppSettings:
     runtime_state_path: Path = Path("data/runtime_state.json")
     mcp_config_path: Path = Path("config/mcp_servers.json")
     mcp_fallback_config_path: Path = Path("config/mcp_servers.sample.json")
+    skill_dirs: list[Path] = field(default_factory=list)
+    skill_max_per_turn: int = 3
+    skill_max_chars: int = 8000
 
 
 
@@ -62,6 +66,25 @@ def _get_float(name: str, default: float) -> float:
         return default
 
 
+def _split_paths(raw: str) -> list[str]:
+    if not raw:
+        return []
+    if os.pathsep in raw:
+        parts = [part.strip() for part in raw.split(os.pathsep)]
+    else:
+        parts = [part.strip() for part in raw.split(",")]
+    return [part for part in parts if part]
+
+
+def _get_path_list(primary: str, fallback: str | None, default: list[str]) -> list[Path]:
+    raw = os.getenv(primary)
+    if not raw and fallback:
+        raw = os.getenv(fallback)
+    if raw:
+        return [Path(path).expanduser() for path in _split_paths(raw)]
+    return [Path(path).expanduser() for path in default]
+
+
 
 def load_settings() -> AppSettings:
     load_dotenv()
@@ -71,6 +94,7 @@ def load_settings() -> AppSettings:
         os.getenv("ASSISTANT_RUNTIME_STATE_PATH", "data/runtime_state.json")
     ).expanduser()
     mcp_config_path = Path(os.getenv("MCP_CONFIG_PATH", "config/mcp_servers.json")).expanduser()
+    skill_dirs = _get_path_list("ANTON_SKILL_DIRS", "SKILL_DIRS", DEFAULT_SKILL_DIRS)
 
     settings = AppSettings(
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL),
@@ -93,6 +117,9 @@ def load_settings() -> AppSettings:
         sqlite_path=sqlite_path,
         runtime_state_path=runtime_state_path,
         mcp_config_path=mcp_config_path,
+        skill_dirs=skill_dirs,
+        skill_max_per_turn=_get_int("SKILL_MAX_PER_TURN", 3),
+        skill_max_chars=_get_int("SKILL_MAX_CHARS", 8000),
     )
 
     settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)

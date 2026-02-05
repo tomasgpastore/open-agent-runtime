@@ -30,6 +30,7 @@ Production-quality Python CLI personal assistant using:
   - multiline input
 - Rich rendering for structured output (panels/tables/status views)
 - Dynamic MCP server enable/disable at runtime.
+- Filesystem skill discovery via `SKILL.md` metadata (Agent Skills).
 - Per-tool and global approval gates before tool execution.
 - Multi-step agent loop with up to 100 tool-iteration cycles by default.
 - Rolling short-term memory budget (20,000 token estimate).
@@ -135,6 +136,9 @@ export MAX_ITERATIONS="100"
 export REQUEST_TIMEOUT_SECONDS="120"
 export MCP_CONFIG_PATH="config/mcp_servers.json"
 export ASSISTANT_SQLITE_PATH="data/assistant.db"
+export ANTON_SKILL_DIRS="skills:~/.codex/skills"
+export SKILL_MAX_PER_TURN="3"
+export SKILL_MAX_CHARS="8000"
 
 # If using Brave MCP web search
 export BRAVE_API_KEY="..."
@@ -143,6 +147,15 @@ export BRAVE_API_KEY="..."
 Note: some Ollama tags (including certain `llama3:8b` builds) do **not** support tool calling.
 If tool calls fail with `does not support tools`, switch to a tool-capable model tag on your server.
 OpenAI usage requires API credentials and API billing. A ChatGPT app subscription does not include API credits.
+
+## Skills
+
+Skills live in folders containing a `SKILL.md` with YAML frontmatter (`name`, `description`). Configure
+skill directories with `ANTON_SKILL_DIRS` (or `SKILL_DIRS`) and manage them via:
+- `/skills` or `/skills list`
+- `/skills refresh`
+- `/skills show <name>`
+- `/skills paths`
 
 ## Run
 

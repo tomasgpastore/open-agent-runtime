@@ -32,6 +32,7 @@ from assistant_cli.mcp_manager import MCPManager
 from assistant_cli.memory_store import SQLiteMemoryStore
 from assistant_cli.memory_tools import wipe_memory_graph
 from assistant_cli.settings import load_settings
+from assistant_cli.skills_manager import SkillManager
 
 
 LOGGER = logging.getLogger(__name__)
@@ -132,6 +133,11 @@ class AssistantCLI:
             config_path=self.settings.mcp_config_path,
             fallback_config_path=self.settings.mcp_fallback_config_path,
         )
+        self.skill_manager = SkillManager(
+            skill_dirs=self.settings.skill_dirs,
+            max_per_turn=self.settings.skill_max_per_turn,
+            max_chars=self.settings.skill_max_chars,
+        )
 
         persisted_selection = self._load_runtime_llm_selection()
         if persisted_selection is not None:
@@ -144,6 +150,7 @@ class AssistantCLI:
             max_iterations=self.settings.max_iterations,
             request_timeout_seconds=self.settings.request_timeout_seconds,
             tool_timeout_seconds=self.settings.tool_timeout_seconds,
+            skill_manager=self.skill_manager,
         )
         self._prompt_session = self._build_prompt_session()
 
@@ -456,7 +463,7 @@ class AssistantCLI:
             return False
 
         if command == "/skills":
-            self._handle_skills_command()
+            self._handle_skills_command(parts[1:])
             return False
 
         if command == "/paths":
@@ -662,27 +669,84 @@ class AssistantCLI:
         )
         self.console.print(Panel.fit(body, title="Short-term Memory", border_style="blue"))
 
-    def _handle_skills_command(self) -> None:
-        table = Table(title="Anton Skills & Capabilities")
-        table.add_column("Area", style="bold")
-        table.add_column("Details")
-        table.add_row(
-            "LLM Providers",
-            f"local (Ollama), openai, openrouter (current: {self.current_provider})",
+    def _handle_skills_command(self, args: Sequence[str]) -> None:
+        if not args or args[0].lower() == "list":
+            self._print_skills_summary()
+            self._print_skills_list()
+            return
+
+        action = args[0].lower()
+        if action == "refresh":
+            self.skill_manager.refresh()
+            self.console.print("Skills refreshed.", style="green")
+            errors = self.skill_manager.refresh_errors()
+            if errors:
+                self.console.print("Some skills could not be loaded:", style="yellow")
+                for err in errors:
+                    self.console.print(f"- {err}", style="yellow")
+            self._print_skills_summary()
+            self._print_skills_list()
+            return
+
+        if action == "show":
+            if len(args) < 2:
+                self.console.print("Usage: /skills show <name>", style="yellow")
+                return
+            query = " ".join(args[1:]).strip()
+            skill = self.skill_manager.get_skill(query)
+            if not skill:
+                self.console.print(f"No skill found for '{query}'.", style="yellow")
+                return
+            panel = Panel.fit(
+                skill.content.strip(),
+                title=f"Skill: {skill.metadata.name}",
+                border_style="blue",
+            )
+            self.console.print(panel)
+            return
+
+        if action == "paths":
+            self._print_skill_paths()
+            return
+
+        self.console.print(
+            "Usage: /skills | /skills list | /skills refresh | /skills show <name> | /skills paths",
+            style="yellow",
         )
+        return
+
+    def _print_skills_summary(self) -> None:
+        table = Table(title="Skill Configuration")
+        table.add_column("Setting", style="bold")
+        table.add_column("Value")
         table.add_row(
-            "Memory",
-            f"short-term: {self.settings.short_term_token_limit} tokens; "
-            f"context target: {self.settings.model_context_window}",
+            "Skill dirs",
+            ", ".join(str(path) for path in self.skill_manager.list_skill_dirs()) or "(none)",
         )
-        table.add_row(
-            "Tools",
-            ", ".join(self.mcp_manager.tool_names()) or "(none)",
-        )
-        table.add_row(
-            "Filesystem Access",
-            ", ".join(self.mcp_manager.list_filesystem_allowed_directories()) or "(none)",
-        )
+        table.add_row("Max skills per turn", str(self.settings.skill_max_per_turn))
+        table.add_row("Max skill chars", str(self.settings.skill_max_chars))
+        table.add_row("Discovered skills", str(len(self.skill_manager.list_skills())))
+        self.console.print(table)
+
+    def _print_skills_list(self) -> None:
+        skills = self.skill_manager.list_skills()
+        table = Table(title="Available Skills")
+        table.add_column("Name", style="bold")
+        table.add_column("Description")
+        table.add_column("Location")
+        if not skills:
+            table.add_row("(none)", "", "")
+        else:
+            for meta in skills:
+                table.add_row(meta.name, meta.description or "", str(meta.skill_md_path))
+        self.console.print(table)
+
+    def _print_skill_paths(self) -> None:
+        table = Table(title="Skill Search Paths")
+        table.add_column("Path", style="bold")
+        table.add_column("Exists")
+        for path in self.skill_manager.list_skill_dirs():
+            table.add_row(str(path), "yes" if path.exists() else "no")
         self.console.print(table)
 
     async def _handle_llm_command(self, args: Sequence[str]) -> None:
@@ -860,7 +924,10 @@ class AssistantCLI:
         table.add_row("/approval global on|off", "Toggle global approval")
         table.add_row("/approval tool <tool> on|off", "Toggle approval for one tool")
         table.add_row("/memory", "Show short-term memory stats")
-        table.add_row("/skills", "Show Anton's capabilities")
+        table.add_row("/skills", "List available skills")
+        table.add_row("/skills refresh", "Rescan skill directories")
+        table.add_row("/skills show <name>", "Show full SKILL.md instructions")
+        table.add_row("/skills paths", "Show configured skill directories")
         table.add_row("/paths", "List filesystem allowed paths")
         table.add_row("/paths add <path>", "Allow filesystem access to a path")
         table.add_row("/paths remove <path>", "Remove an allowed filesystem path")
@@ -904,7 +971,7 @@ class AssistantCLI:
         if root_command == "/llm":
             return ["local <model>", "openai <model>", "openrouter <model>"]
         if root_command == "/skills":
-            return []
+            return ["list", "refresh", "show <name>", "paths"]
         return []
 
     def _parse_on_off(self, value: str) -> bool | None:
