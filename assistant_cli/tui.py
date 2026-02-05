@@ -12,6 +12,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
+from textual import events
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.message import Message
@@ -42,15 +43,7 @@ class InputSubmitted(Message):
 
 
 class ChatInput(TextArea):
-    def on_key(self, event) -> None:  # type: ignore[override]
-        if event.key == "enter" and not event.shift:
-            event.prevent_default()
-            value = self.text.strip()
-            if value:
-                self.post_message(InputSubmitted(value))
-                self.text = ""
-            return
-        super().on_key(event)
+    pass
 
 
 class MessageBubble(Static):
@@ -230,6 +223,22 @@ class AssistantTUI(App):
     async def on_mount(self) -> None:
         await self._safe_refresh_mcp("startup")
         self._render_header()
+        self.query_one(ChatInput).focus()
+
+    async def on_key(self, event: events.Key) -> None:  # type: ignore[override]
+        if (
+            event.key == "enter"
+            and not event.shift
+            and self.query_one(ChatInput).has_focus
+        ):
+            event.prevent_default()
+            event.stop()
+            value = self.query_one(ChatInput).text.strip()
+            if value:
+                self.post_message(InputSubmitted(value))
+                self.query_one(ChatInput).text = ""
+            return
+        return
 
     async def _safe_refresh_mcp(self, reason: str) -> None:
         try:
