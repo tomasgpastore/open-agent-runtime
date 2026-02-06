@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 from datetime import datetime
 from typing import Iterable
 
@@ -78,8 +79,12 @@ class MessageBubble(Static):
         self.update(self._render())
 
     def _render(self) -> Group:
-        label = "You" if self.role == "user" else "Anton" if self.role == "assistant" else "System"
-        header = Text(label, style="bold cyan" if self.role == "assistant" else "bold green")
+        if self.role == "user":
+            header = Text("you> ", style="bold green")
+        elif self.role == "assistant":
+            header = Text("anton> ", style="bold cyan")
+        else:
+            header = Text("system> ", style="bold yellow")
         body = Text(self.content)
         return Group(header, body)
 
@@ -105,16 +110,15 @@ class ToolCard(Static):
         self.update(self._render())
 
     def _render(self) -> Panel:
-        status_icon = "✓" if self.status == "success" else "✗" if self.status == "error" else "⏳"
-        lines = [f"Status: {status_icon} {self.status}"]
+        status_icon = "ok" if self.status == "success" else "err" if self.status == "error" else "run"
+        lines = [f"tool> {self.tool_name} [{status_icon}]"]
         if self.expanded and self.details:
             lines.append("")
-            lines.append("Result:")
             lines.append(self.details)
         elif self.details:
-            lines.append("[Ctrl+O to toggle details]")
+            lines.append("ctrl+o to toggle details")
         body = "\n".join(lines)
-        return Panel(body, title=f"Tool Call: {self.tool_name}", border_style="yellow")
+        return Panel.fit(body, border_style="yellow")
 
     def render(self) -> Panel:  # type: ignore[override]
         return self._render()
@@ -157,13 +161,14 @@ class AssistantTUI(App):
     }
 
     #header {
-        padding: 1 2;
+        height: 2;
+        padding: 0 1;
         background: transparent;
     }
 
     #message-area {
         height: 1fr;
-        padding: 1 2;
+        padding: 0 1;
         background: transparent;
         border-top: solid $primary;
         border-bottom: solid $primary;
@@ -184,17 +189,20 @@ class AssistantTUI(App):
     }
 
     #input-area {
-        height: 5;
-        padding: 0 2 0 2;
+        height: 3;
+        min-height: 3;
+        padding: 0 1;
         background: transparent;
         border: none;
     }
 
     #footer {
         height: 1;
-        padding: 0 2;
+        min-height: 1;
+        padding: 0 1;
         background: transparent;
         border-top: solid $primary;
+        color: $text-muted;
     }
 
     #approval-dialog {
@@ -246,18 +254,22 @@ class AssistantTUI(App):
         )
 
         self._current_tool_cards: list[ToolCard] = []
+        self._shutdown_started = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="header")
         yield ScrollableContainer(id="message-area")
         yield ChatInput(id="input-area")
-        yield Static("Ctrl+C quit · Ctrl+O toggle tools · Ctrl+R new", id="footer")
+        yield Static("enter send | shift+enter newline | /help commands | ctrl+c quit", id="footer")
 
     async def on_mount(self) -> None:
         await self._safe_refresh_mcp("startup")
         self._render_header()
         self.query_one(ChatInput).focus()
         self.query_one("#message-area", ScrollableContainer).can_focus = False
+
+    async def on_unmount(self) -> None:
+        await self._shutdown_resources()
 
     async def on_key(self, event: events.Key) -> None:  # type: ignore[override]
         if event.key != "enter":
@@ -284,10 +296,16 @@ class AssistantTUI(App):
     def _render_header(self) -> None:
         now = datetime.now().strftime("%H:%M:%S")
         status = "connected" if any(s.connected for s in self.mcp_manager.list_statuses()) else "offline"
-        header = Panel(
-            f"Model: {self.current_model} | Provider: {self.current_provider} | MCP: {status} | {now}",
-            title="LangGraph MCP Assistant",
-            border_style="cyan",
+        header = Text.assemble(
+            ("anton", "bold cyan"),
+            (" | ", "dim"),
+            (f"model {self.current_model}", "dim"),
+            (" | ", "dim"),
+            (f"provider {self.current_provider}", "dim"),
+            (" | ", "dim"),
+            (f"mcp {status}", "dim"),
+            (" | ", "dim"),
+            (now, "dim"),
         )
         self.query_one("#header", Static).update(header)
 
@@ -332,16 +350,22 @@ class AssistantTUI(App):
         )
 
         assistant_bubble = self._post_assistant_message()
+        message_area = self.query_one("#message-area", ScrollableContainer)
+        loop = asyncio.get_running_loop()
+
+        def _dispatch_ui(callback, *args) -> None:
+            if threading.current_thread() is threading.main_thread():
+                loop.call_soon(callback, *args)
+            else:
+                loop.call_soon_threadsafe(callback, *args)
 
         def on_token(token: str) -> None:
-            self.call_from_thread(assistant_bubble.append, token)
+            _dispatch_ui(assistant_bubble.append, token)
 
         def on_tool(tool_name: str) -> None:
             card = ToolCard(tool_name)
             self._current_tool_cards.append(card)
-            self.call_from_thread(
-                self.query_one("#message-area", ScrollableContainer).mount, card
-            )
+            _dispatch_ui(message_area.mount, card)
 
         tool_map = {tool.name: tool for tool in self.mcp_manager.active_tools()}
 
@@ -355,10 +379,10 @@ class AssistantTUI(App):
                 approval_prompt=self._approval_prompt,
             )
         except Exception as exc:  # noqa: BLE001
-            self.call_from_thread(assistant_bubble.set_content, f"Assistant error: {exc}")
+            _dispatch_ui(assistant_bubble.set_content, f"Assistant error: {exc}")
             return
 
-        self._finalize_tool_cards(result.messages)
+        _dispatch_ui(self._finalize_tool_cards, result.messages)
         final_messages, post_truncation = self.memory_store.enforce_token_limit(result.messages)
         self.memory_store.save_messages(
             final_messages,
@@ -366,7 +390,7 @@ class AssistantTUI(App):
         )
 
         if not assistant_bubble.content.strip():
-            self.call_from_thread(assistant_bubble.set_content, result.final_answer)
+            _dispatch_ui(assistant_bubble.set_content, result.final_answer)
 
     def _finalize_tool_cards(self, messages: Iterable[BaseMessage]) -> None:
         tool_messages = [msg for msg in messages if isinstance(msg, ToolMessage)]
@@ -733,6 +757,23 @@ class AssistantTUI(App):
 
     def action_new_session(self) -> None:
         self.run_worker(self._handle_new_command(), exclusive=True)
+
+    async def action_quit(self) -> None:
+        await self._shutdown_resources()
+        self.exit()
+
+    async def _shutdown_resources(self) -> None:
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
+        try:
+            await self.agent.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await self.mcp_manager.aclose()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _load_persisted_llm(self) -> None:
         path = self.settings.runtime_state_path
