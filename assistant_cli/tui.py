@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import json
 import os
 import threading
@@ -408,13 +407,12 @@ class AssistantTUI(App):
         assistant_bubble = self._post_assistant_message()
         message_area = self.query_one("#message-area", ScrollableContainer)
         loop = asyncio.get_running_loop()
-        empty_context = contextvars.Context()
 
         def _dispatch_ui(callback, *args) -> None:
             if threading.current_thread() is threading.main_thread():
-                loop.call_soon(callback, *args, context=empty_context)
+                loop.call_soon(callback, *args)
             else:
-                loop.call_soon_threadsafe(callback, *args, context=empty_context)
+                loop.call_soon_threadsafe(callback, *args)
 
         def on_token(token: str) -> None:
             _dispatch_ui(assistant_bubble.append, token)
