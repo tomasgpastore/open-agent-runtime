@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import threading
 from datetime import datetime
 from typing import Iterable
 
-from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
-from rich.console import Group
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.tools import BaseTool
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -20,7 +21,7 @@ from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static, TextArea
 
-from assistant_cli.agent_graph import LangGraphAgent
+from assistant_cli.agent_graph import AgentRunResult, LangGraphAgent
 from assistant_cli.approval import ApprovalManager
 from assistant_cli.llm_client import (
     OpenAILLMClient,
@@ -44,7 +45,51 @@ class InputSubmitted(Message):
         self.value = value
 
 
+class _TuiBaselineAgent:
+    """Deterministic no-network agent for TUI baseline tests."""
+
+    def set_llm_client(self, llm_client) -> None:
+        return
+
+    async def aclose(self) -> None:
+        return
+
+    async def run(
+        self,
+        messages: list[BaseMessage],
+        tools: dict[str, BaseTool],
+        approval_manager: ApprovalManager,
+        input_fn=input,
+        stream_callback=None,
+        tool_event_callback=None,
+        approval_prompt=None,
+    ) -> AgentRunResult:
+        def _emit_stream() -> None:
+            if stream_callback is not None:
+                stream_callback("Pong")
+
+        worker = threading.Thread(target=_emit_stream, daemon=True)
+        worker.start()
+        worker.join()
+
+        return AgentRunResult(
+            messages=[*messages, AIMessage(content="Pong")],
+            final_answer="Pong",
+            stop_reason=None,
+        )
+
+
 class ChatInput(TextArea):
+    _MAX_VISIBLE_LINES = 8
+
+    def _sync_height(self) -> None:
+        visible_lines = max(1, self.text.count("\n") + 1)
+        self.styles.height = min(visible_lines, self._MAX_VISIBLE_LINES)
+
+    def on_mount(self) -> None:
+        self.show_line_numbers = False
+        self._sync_height()
+
     async def _on_key(self, event: events.Key) -> None:  # type: ignore[override]
         if event.key == "enter":
             event.stop()
@@ -53,43 +98,43 @@ class ChatInput(TextArea):
             if value:
                 self.post_message(InputSubmitted(value))
                 self.text = ""
+                self._sync_height()
             return
         if event.key == "shift+enter":
             event.stop()
             event.prevent_default()
             start, end = self.selection
             self._replace_via_keyboard("\n", start, end)
+            self._sync_height()
             return
         await super()._on_key(event)
+        self._sync_height()
 
 
 class MessageBubble(Static):
     def __init__(self, role: str, content: str = "") -> None:
-        super().__init__()
+        super().__init__("")
         self.role = role
         self.content = content
         self.add_class(f"role-{role}")
+        self._refresh()
 
     def append(self, chunk: str) -> None:
         self.content += chunk
-        self.update(self._render())
+        self._refresh()
 
     def set_content(self, content: str) -> None:
         self.content = content
-        self.update(self._render())
+        self._refresh()
 
-    def _render(self) -> Group:
+    def _refresh(self) -> None:
         if self.role == "user":
-            header = Text("you> ", style="bold green")
+            prefix = "you> "
         elif self.role == "assistant":
-            header = Text("anton> ", style="bold cyan")
+            prefix = "anton> "
         else:
-            header = Text("system> ", style="bold yellow")
-        body = Text(self.content)
-        return Group(header, body)
-
-    def render(self) -> Group:  # type: ignore[override]
-        return self._render()
+            prefix = "system> "
+        self.update(f"{prefix}{self.content}")
 
 
 class ToolCard(Static):
@@ -189,8 +234,9 @@ class AssistantTUI(App):
     }
 
     #input-area {
-        height: 3;
-        min-height: 3;
+        height: 1;
+        min-height: 1;
+        max-height: 8;
         padding: 0 1;
         background: transparent;
         border: none;
@@ -222,6 +268,12 @@ class AssistantTUI(App):
     def __init__(self) -> None:
         super().__init__()
         self.settings = load_settings()
+        self._test_mode = os.getenv("ASSISTANT_TEST_MODE", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self.current_provider = "local"
         self.current_model = self.settings.ollama_model
         self._load_persisted_llm()
@@ -244,14 +296,17 @@ class AssistantTUI(App):
             max_chars=self.settings.skill_max_chars,
         )
 
-        self.agent = LangGraphAgent(
-            db_path=self.settings.sqlite_path,
-            llm_client=self._build_initial_llm_client(),
-            max_iterations=self.settings.max_iterations,
-            request_timeout_seconds=self.settings.request_timeout_seconds,
-            tool_timeout_seconds=self.settings.tool_timeout_seconds,
-            skill_manager=self.skill_manager,
-        )
+        if self._test_mode:
+            self.agent = _TuiBaselineAgent()
+        else:
+            self.agent = LangGraphAgent(
+                db_path=self.settings.sqlite_path,
+                llm_client=self._build_initial_llm_client(),
+                max_iterations=self.settings.max_iterations,
+                request_timeout_seconds=self.settings.request_timeout_seconds,
+                tool_timeout_seconds=self.settings.tool_timeout_seconds,
+                skill_manager=self.skill_manager,
+            )
 
         self._current_tool_cards: list[ToolCard] = []
         self._shutdown_started = False
@@ -263,7 +318,8 @@ class AssistantTUI(App):
         yield Static("enter send | shift+enter newline | /help commands | ctrl+c quit", id="footer")
 
     async def on_mount(self) -> None:
-        await self._safe_refresh_mcp("startup")
+        if not self._test_mode:
+            await self._safe_refresh_mcp("startup")
         self._render_header()
         self.query_one(ChatInput).focus()
         self.query_one("#message-area", ScrollableContainer).can_focus = False
@@ -352,12 +408,13 @@ class AssistantTUI(App):
         assistant_bubble = self._post_assistant_message()
         message_area = self.query_one("#message-area", ScrollableContainer)
         loop = asyncio.get_running_loop()
+        empty_context = contextvars.Context()
 
         def _dispatch_ui(callback, *args) -> None:
             if threading.current_thread() is threading.main_thread():
-                loop.call_soon(callback, *args)
+                loop.call_soon(callback, *args, context=empty_context)
             else:
-                loop.call_soon_threadsafe(callback, *args)
+                loop.call_soon_threadsafe(callback, *args, context=empty_context)
 
         def on_token(token: str) -> None:
             _dispatch_ui(assistant_bubble.append, token)
@@ -881,4 +938,4 @@ class AssistantTUI(App):
 def run_tui() -> None:
     configure_logging()
     app = AssistantTUI()
-    app.run()
+    app.run(inline=True)
