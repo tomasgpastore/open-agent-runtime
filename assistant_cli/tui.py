@@ -39,11 +39,18 @@ from assistant_cli.skills_manager import SkillManager
 
 
 ANTON_ASCII = (
-    "    _          _\n"
-    "   / \\   _ __ | |_ ___  _ __\n"
-    "  / _ \\ | '_ \\| __/ _ \\| '_ \\\n"
-    " / ___ \\| | | | || (_) | | | |\n"
-    "/_/   \\_\\_| |_|\\__\\___/|_| |_|\n"
+    "   _    _   _ _____ ___  _   _ \n"
+    "  / \\  | \\ | |_   _/ _ \\| \\ | |\n"
+    " / _ \\ |  \\| | | || | | |  \\| |\n"
+    "/ ___ \\| |\\  | | || |_| | |\\  |\n"
+    "/_/   \\_\\_| \\_| |_| \\___/|_| \\_|\n"
+)
+
+ANTON_TIPS = (
+    "Tips for getting started:\n"
+    "1. Ask questions, edit files, or run commands.\n"
+    "2. Be specific for best results.\n"
+    "3. Use /help for command details."
 )
 
 
@@ -96,6 +103,7 @@ class ChatInput(TextArea):
 
     def on_mount(self) -> None:
         self.show_line_numbers = False
+        self.placeholder = "Type your message..."
         self._sync_height()
 
     async def _on_key(self, event: events.Key) -> None:  # type: ignore[override]
@@ -214,7 +222,7 @@ class AssistantTUI(App):
     }
 
     #header {
-        height: 2;
+        height: 1;
         padding: 0 1;
         background: transparent;
         border-bottom: solid blue;
@@ -222,17 +230,34 @@ class AssistantTUI(App):
 
     #message-area {
         height: 1fr;
-        padding: 0 1;
+        padding: 1 1;
         background: transparent;
-        border-top: solid blue;
-        border-bottom: solid blue;
-        border-left: none;
-        border-right: none;
+        border: none;
     }
 
-    #anton-intro {
+    #anton-ascii {
         color: blue;
         margin: 0 0 1 0;
+    }
+
+    #anton-tagline {
+        color: blue;
+        text-style: bold;
+        margin: 0 0 1 0;
+    }
+
+    #anton-tips {
+        color: $text-muted;
+        margin: 0 0 1 0;
+    }
+
+    MessageBubble {
+        color: $text;
+        background: transparent;
+    }
+
+    MessageBubble.role-system {
+        color: blue;
     }
 
     MessageBubble.role-user {
@@ -247,16 +272,20 @@ class AssistantTUI(App):
         margin: 0 0 1 0;
     }
 
+    #input-frame {
+        padding: 0 1;
+        background: transparent;
+        border-top: solid blue;
+        border-bottom: solid blue;
+    }
+
     #input-area {
         height: 1;
         min-height: 1;
         max-height: 8;
         padding: 0 1;
         background: transparent;
-        border-top: solid blue;
-        border-bottom: none;
-        border-left: none;
-        border-right: none;
+        border: round blue;
         color: blue;
     }
 
@@ -266,6 +295,10 @@ class AssistantTUI(App):
 
     #input-area .text-area--input {
         background: transparent;
+        color: blue;
+    }
+
+    #input-area .text-area--cursor {
         color: blue;
     }
 
@@ -341,8 +374,11 @@ class AssistantTUI(App):
     def compose(self) -> ComposeResult:
         yield Static(id="header")
         yield ScrollableContainer(id="message-area")
-        yield ChatInput(id="input-area")
-        yield Static("commands: /help /mcp /paths /llm /new /quit | enter send | shift+enter newline", id="footer")
+        yield Vertical(
+            ChatInput(id="input-area"),
+            id="input-frame",
+        )
+        yield Static("/help /mcp /paths /llm /new /quit | enter send | shift+enter newline", id="footer")
 
     async def on_mount(self) -> None:
         if not self._test_mode:
@@ -382,20 +418,22 @@ class AssistantTUI(App):
         status = "connected" if any(s.connected for s in self.mcp_manager.list_statuses()) else "offline"
         header = Text.assemble(
             ("Anton", "bold blue"),
-            (" | ", "dim"),
-            (f"model {self.current_model}", "dim"),
-            (" | ", "dim"),
-            (f"provider {self.current_provider}", "dim"),
-            (" | ", "dim"),
-            (f"mcp {status}", "dim"),
-            (" | ", "dim"),
-            (now, "dim"),
+            (" | ", "blue"),
+            (f"model {self.current_model}", "white"),
+            (" | ", "blue"),
+            (f"provider {self.current_provider}", "white"),
+            (" | ", "blue"),
+            (f"mcp {status}", "white"),
+            (" | ", "blue"),
+            (now, "white"),
         )
         self.query_one("#header", Static).update(header)
 
     def _mount_intro(self) -> None:
-        intro = f"{ANTON_ASCII}\nWhat can I do for you?"
-        self.query_one("#message-area", ScrollableContainer).mount(Static(intro, id="anton-intro"))
+        area = self.query_one("#message-area", ScrollableContainer)
+        area.mount(Static(ANTON_ASCII, id="anton-ascii"))
+        area.mount(Static("What can I do for you?", id="anton-tagline"))
+        area.mount(Static(ANTON_TIPS, id="anton-tips"))
 
     def _post_system_message(self, content: str | Table | Panel) -> None:
         area = self.query_one("#message-area", ScrollableContainer)
