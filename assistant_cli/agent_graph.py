@@ -24,17 +24,20 @@ from assistant_cli.skills_manager import SkillManager
 
 
 LOGGER = logging.getLogger(__name__)
-MAX_IDENTICAL_TOOL_CALLS_PER_TURN = 3
+MAX_IDENTICAL_TOOL_CALLS_PER_TURN = 2
 SYSTEM_PROMPT_PATH = Path(__file__).resolve().parents[1] / "anton-0.1.md"
 
 
 def _build_system_prompt(tool_names: list[str], skills_prompt: str) -> str:
-    now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    now = datetime.now().astimezone()
+    now_timestamp = now.strftime("%Y-%m-%d %H:%M:%S %Z")
+    current_date = now.strftime("%A, %B %d, %Y")
     os_info = platform.platform()
     tool_list = ", ".join(sorted(tool_names)) if tool_names else "none"
     template = _load_system_prompt_template()
     rendered = (
-        template.replace("{{currentDateTime}}", now)
+        template.replace("{{currentDateTime}}", now_timestamp)
+        .replace("{{current_date}}", current_date)
         .replace("{{osInfo}}", os_info)
         .replace("{{toolList}}", tool_list)
     )
