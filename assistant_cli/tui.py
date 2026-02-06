@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import json
 import os
 import threading
@@ -37,6 +36,15 @@ from assistant_cli.memory_store import SQLiteMemoryStore
 from assistant_cli.memory_tools import wipe_memory_graph
 from assistant_cli.settings import load_settings
 from assistant_cli.skills_manager import SkillManager
+
+
+ANTON_ASCII = (
+    "    _          _\n"
+    "   / \\   _ __ | |_ ___  _ __\n"
+    "  / _ \\ | '_ \\| __/ _ \\| '_ \\\n"
+    " / ___ \\| | | | || (_) | | | |\n"
+    "/_/   \\_\\_| |_|\\__\\___/|_| |_|\n"
+)
 
 
 class InputSubmitted(Message):
@@ -209,16 +217,22 @@ class AssistantTUI(App):
         height: 2;
         padding: 0 1;
         background: transparent;
+        border-bottom: solid blue;
     }
 
     #message-area {
         height: 1fr;
         padding: 0 1;
         background: transparent;
-        border-top: solid $primary;
-        border-bottom: solid $primary;
+        border-top: solid blue;
+        border-bottom: solid blue;
         border-left: none;
         border-right: none;
+    }
+
+    #anton-intro {
+        color: blue;
+        margin: 0 0 1 0;
     }
 
     MessageBubble.role-user {
@@ -239,7 +253,20 @@ class AssistantTUI(App):
         max-height: 8;
         padding: 0 1;
         background: transparent;
-        border: none;
+        border-top: solid blue;
+        border-bottom: none;
+        border-left: none;
+        border-right: none;
+        color: blue;
+    }
+
+    #input-area .text-area--gutter {
+        background: transparent;
+    }
+
+    #input-area .text-area--input {
+        background: transparent;
+        color: blue;
     }
 
     #footer {
@@ -247,13 +274,13 @@ class AssistantTUI(App):
         min-height: 1;
         padding: 0 1;
         background: transparent;
-        border-top: solid $primary;
-        color: $text-muted;
+        border-top: solid blue;
+        color: blue;
     }
 
     #approval-dialog {
         padding: 1 2;
-        background: $panel;
+        background: transparent;
         border: round $primary;
     }
     """
@@ -315,12 +342,13 @@ class AssistantTUI(App):
         yield Static(id="header")
         yield ScrollableContainer(id="message-area")
         yield ChatInput(id="input-area")
-        yield Static("enter send | shift+enter newline | /help commands | ctrl+c quit", id="footer")
+        yield Static("commands: /help /mcp /paths /llm /new /quit | enter send | shift+enter newline", id="footer")
 
     async def on_mount(self) -> None:
         if not self._test_mode:
             await self._safe_refresh_mcp("startup")
         self._render_header()
+        self._mount_intro()
         self.query_one(ChatInput).focus()
         self.query_one("#message-area", ScrollableContainer).can_focus = False
 
@@ -353,7 +381,7 @@ class AssistantTUI(App):
         now = datetime.now().strftime("%H:%M:%S")
         status = "connected" if any(s.connected for s in self.mcp_manager.list_statuses()) else "offline"
         header = Text.assemble(
-            ("anton", "bold cyan"),
+            ("Anton", "bold blue"),
             (" | ", "dim"),
             (f"model {self.current_model}", "dim"),
             (" | ", "dim"),
@@ -364,6 +392,10 @@ class AssistantTUI(App):
             (now, "dim"),
         )
         self.query_one("#header", Static).update(header)
+
+    def _mount_intro(self) -> None:
+        intro = f"{ANTON_ASCII}\nWhat can I do for you?"
+        self.query_one("#message-area", ScrollableContainer).mount(Static(intro, id="anton-intro"))
 
     def _post_system_message(self, content: str | Table | Panel) -> None:
         area = self.query_one("#message-area", ScrollableContainer)
@@ -408,13 +440,12 @@ class AssistantTUI(App):
         assistant_bubble = self._post_assistant_message()
         message_area = self.query_one("#message-area", ScrollableContainer)
         loop = asyncio.get_running_loop()
-        empty_context = contextvars.Context()
 
         def _dispatch_ui(callback, *args) -> None:
             if threading.current_thread() is threading.main_thread():
-                loop.call_soon(callback, *args, context=empty_context)
+                loop.call_soon(callback, *args)
             else:
-                loop.call_soon_threadsafe(callback, *args, context=empty_context)
+                loop.call_soon_threadsafe(callback, *args)
 
         def on_token(token: str) -> None:
             _dispatch_ui(assistant_bubble.append, token)
