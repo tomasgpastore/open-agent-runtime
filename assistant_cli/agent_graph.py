@@ -481,8 +481,13 @@ class LangGraphAgent:
             if isinstance(message, AIMessage) and not message.tool_calls:
                 content = message.content
                 if isinstance(content, str):
-                    return content
-                return str(content)
+                    if content.strip():
+                        return content
+                    continue
+                rendered = str(content)
+                if rendered.strip():
+                    return rendered
+                continue
         return "I could not produce a final answer."
 
     def _requires_external_tool(self, messages: list[BaseMessage]) -> bool:

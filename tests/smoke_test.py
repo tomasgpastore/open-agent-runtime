@@ -116,6 +116,17 @@ class MarkdownRenderTests(unittest.TestCase):
         self.assertIn('args={"path": "notes.txt"}', text)
         self.assertIn("output=OK", text)
 
+    def test_streaming_ignores_leading_whitespace_only_chunks(self) -> None:
+        streamer = ResponseStreamPrinter()
+        captured_stdout = io.StringIO()
+        with redirect_stdout(captured_stdout):
+            streamer.on_token("   ")
+            streamer.on_token("\n")
+            streamer.on_token("Hello")
+            streamer.finish()
+
+        self.assertEqual(captured_stdout.getvalue(), "> Hello\n\n")
+
     def test_run_with_cleanup_closes_on_cancellation(self) -> None:
         class _DummyApp:
             def __init__(self) -> None:
@@ -442,6 +453,24 @@ class ToolLoopGuardTests(unittest.TestCase):
             rendered = agent._stringify_tool_result(raw)
             self.assertIn("[tool output truncated:", rendered)
             self.assertLess(len(rendered), len(raw))
+
+    def test_extract_final_answer_skips_empty_ai_messages(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            agent = LangGraphAgent(
+                db_path=Path(tmp_dir) / "graph.db",
+                llm_client=_DummyLLMClient(),
+                max_iterations=10,
+                request_timeout_seconds=30,
+                tool_timeout_seconds=5,
+            )
+
+            messages: list[BaseMessage] = [
+                HumanMessage(content="do it"),
+                AIMessage(content=""),
+                AIMessage(content="   "),
+                AIMessage(content="Done."),
+            ]
+            self.assertEqual(agent._extract_final_answer(messages), "Done.")
 
 
 if __name__ == "__main__":

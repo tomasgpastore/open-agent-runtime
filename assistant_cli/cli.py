@@ -139,6 +139,8 @@ class ResponseStreamPrinter:
             return
         cleaned = _strip_ansi_codes(token).replace("\r", "")
         cleaned = STREAM_CONTROL_RE.sub("", cleaned)
+        if not self._line_started:
+            cleaned = cleaned.lstrip()
         if not cleaned:
             return
         if not self._line_open:
@@ -147,7 +149,6 @@ class ResponseStreamPrinter:
             self._line_open = True
             self._line_started = False
         if not self._line_started:
-            cleaned = cleaned.lstrip()
             self._line_started = True
         sys.stdout.write(cleaned)
         sys.stdout.flush()
