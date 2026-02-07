@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import json
@@ -11,9 +13,35 @@ from langchain_core.tools import BaseTool
 
 from assistant_cli.agent_graph import LangGraphAgent
 from assistant_cli.approval import ApprovalManager
+from assistant_cli.cli import AssistantCLI
 from assistant_cli.llm_client import OpenAILLMClient, OpenAILLMConfig
 from assistant_cli.mcp_manager import MCPManager
 from assistant_cli.memory_store import SQLiteMemoryStore
+
+
+class MarkdownRenderTests(unittest.TestCase):
+    def test_render_markdown_ansi_has_no_stdout_side_effect(self) -> None:
+        cli = AssistantCLI.__new__(AssistantCLI)
+        captured_stdout = io.StringIO()
+        with redirect_stdout(captured_stdout):
+            rendered = AssistantCLI._render_markdown_ansi(cli, "# Nebula")
+
+        self.assertEqual(captured_stdout.getvalue(), "")
+        self.assertIn("Nebula", rendered)
+        self.assertIn("\x1b[", rendered)
+
+    def test_markdown_detection_distinguishes_plain_text(self) -> None:
+        cli = AssistantCLI.__new__(AssistantCLI)
+        self.assertTrue(AssistantCLI._looks_like_markdown(cli, "## Header\n- item"))
+        self.assertFalse(AssistantCLI._looks_like_markdown(cli, "Hey! 👋\n\nWhat's up?"))
+
+    def test_plain_response_collapses_paragraph_breaks_and_leaves_prompt_gap(self) -> None:
+        cli = AssistantCLI.__new__(AssistantCLI)
+        captured_stdout = io.StringIO()
+        with redirect_stdout(captured_stdout):
+            AssistantCLI._print_plain_response(cli, "Hey! 👋\n\nWhat's up?")
+
+        self.assertEqual(captured_stdout.getvalue(), "> Hey! 👋\nWhat's up?\n\n")
 
 
 class MemoryStoreTests(unittest.TestCase):
