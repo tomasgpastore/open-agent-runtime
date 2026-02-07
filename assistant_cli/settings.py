@@ -30,11 +30,12 @@ class AppSettings:
     model_context_window: int = 20000
     short_term_token_limit: int = 20000
     max_iterations: int = 100
-    request_timeout_seconds: int = 120
+    request_timeout_seconds: int = 600
     llm_request_timeout_seconds: int = 90
     llm_retry_attempts: int = 3
     llm_retry_backoff_seconds: float = 1.5
     tool_timeout_seconds: int = 45
+    mcp_connect_timeout_seconds: float = 12.0
     sqlite_path: Path = Path("data/assistant.db")
     runtime_state_path: Path = Path("data/runtime_state.json")
     mcp_config_path: Path = Path("config/mcp_servers.json")
@@ -109,11 +110,12 @@ def load_settings() -> AppSettings:
         model_context_window=_get_int("MODEL_CONTEXT_WINDOW", 20000),
         short_term_token_limit=_get_int("SHORT_TERM_TOKEN_LIMIT", 20000),
         max_iterations=_get_int("MAX_ITERATIONS", 100),
-        request_timeout_seconds=_get_int("REQUEST_TIMEOUT_SECONDS", 120),
+        request_timeout_seconds=_get_int("REQUEST_TIMEOUT_SECONDS", 600),
         llm_request_timeout_seconds=_get_int("LLM_REQUEST_TIMEOUT_SECONDS", 90),
         llm_retry_attempts=_get_int("LLM_RETRY_ATTEMPTS", 3),
         llm_retry_backoff_seconds=_get_float("LLM_RETRY_BACKOFF_SECONDS", 1.5),
         tool_timeout_seconds=_get_int("TOOL_TIMEOUT_SECONDS", 45),
+        mcp_connect_timeout_seconds=_get_float("MCP_CONNECT_TIMEOUT_SECONDS", 12.0),
         sqlite_path=sqlite_path,
         runtime_state_path=runtime_state_path,
         mcp_config_path=mcp_config_path,

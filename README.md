@@ -127,7 +127,8 @@ export OLLAMA_TEMPERATURE="0.1"
 export SHORT_TERM_TOKEN_LIMIT="20000"
 export MODEL_CONTEXT_WINDOW="20000"
 export MAX_ITERATIONS="100"
-export REQUEST_TIMEOUT_SECONDS="120"
+export REQUEST_TIMEOUT_SECONDS="600"
+export MCP_CONNECT_TIMEOUT_SECONDS="12"
 export MCP_CONFIG_PATH="config/mcp_servers.json"
 export ASSISTANT_SQLITE_PATH="data/assistant.db"
 export ANTON_SKILL_DIRS="skills:~/.codex/skills"
@@ -155,6 +156,13 @@ skill directories with `ANTON_SKILL_DIRS` (or `SKILL_DIRS`) and manage them via:
 
 ```bash
 python main.py
+```
+
+Optional CLI wrappers (from repo root):
+
+```bash
+bin/anton .
+bin/anton /path/to/project
 ```
 
 ## MCP configuration

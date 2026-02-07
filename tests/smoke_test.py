@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import asyncio
 import io
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,9 +12,9 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.messages import BaseMessage
 from langchain_core.tools import BaseTool
 
-from assistant_cli.agent_graph import LangGraphAgent
+from assistant_cli.agent_graph import AgentRunResult, LangGraphAgent, MAX_TOOL_RESULT_CHARS
 from assistant_cli.approval import ApprovalManager
-from assistant_cli.cli import AssistantCLI
+from assistant_cli.cli import AssistantCLI, ResponseStreamPrinter, _run_with_cleanup
 from assistant_cli.llm_client import OpenAILLMClient, OpenAILLMConfig
 from assistant_cli.mcp_manager import MCPManager
 from assistant_cli.memory_store import SQLiteMemoryStore
@@ -42,6 +43,94 @@ class MarkdownRenderTests(unittest.TestCase):
             AssistantCLI._print_plain_response(cli, "Hey! 👋\n\nWhat's up?")
 
         self.assertEqual(captured_stdout.getvalue(), "> Hey! 👋\nWhat's up?\n\n")
+
+    def test_markdown_mode_keeps_real_streaming(self) -> None:
+        class _DummyMemoryStore:
+            def __init__(self) -> None:
+                self.saved_messages = None
+                self.saved_truncation = None
+
+            def load_messages(self):
+                return []
+
+            def enforce_token_limit(self, messages):
+                return messages, False
+
+            def save_messages(self, messages, truncation_occurred: bool) -> None:
+                self.saved_messages = messages
+                self.saved_truncation = truncation_occurred
+
+        class _DummyMCPManager:
+            def active_tools(self):
+                return []
+
+        class _DummyAgent:
+            def __init__(self) -> None:
+                self.last_stream_callback = None
+
+            async def run(self, **kwargs):
+                self.last_stream_callback = kwargs.get("stream_callback")
+                stream_cb = kwargs.get("stream_callback")
+                if stream_cb is not None:
+                    stream_cb("Hello")
+                return AgentRunResult(
+                    messages=kwargs["messages"] + [AIMessage(content="Hello")],
+                    final_answer="Hello",
+                    stop_reason=None,
+                )
+
+        cli = AssistantCLI.__new__(AssistantCLI)
+        cli.memory_store = _DummyMemoryStore()
+        cli.mcp_manager = _DummyMCPManager()
+        cli.approval_manager = ApprovalManager()
+        cli.agent = _DummyAgent()
+        cli._markdown_enabled = True
+        cli.console = None
+
+        captured_stdout = io.StringIO()
+        with redirect_stdout(captured_stdout):
+            asyncio.run(
+                AssistantCLI._handle_user_message_with_content(
+                    cli,
+                    HumanMessage(content="Hi"),
+                )
+            )
+
+        self.assertIsNotNone(cli.agent.last_stream_callback)
+        self.assertIn("> Hello", captured_stdout.getvalue())
+
+    def test_tool_event_includes_args_and_output_status(self) -> None:
+        streamer = ResponseStreamPrinter()
+        captured_stdout = io.StringIO()
+        with redirect_stdout(captured_stdout):
+            streamer.on_tool(
+                {
+                    "tool_name": "read_file",
+                    "args": {"path": "notes.txt"},
+                    "status": "OK",
+                }
+            )
+
+        text = captured_stdout.getvalue()
+        self.assertIn("tool> read_file", text)
+        self.assertIn('args={"path": "notes.txt"}', text)
+        self.assertIn("output=OK", text)
+
+    def test_run_with_cleanup_closes_on_cancellation(self) -> None:
+        class _DummyApp:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def run(self) -> None:
+                raise asyncio.CancelledError()
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        app = _DummyApp()
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(_run_with_cleanup(app))
+        self.assertTrue(app.closed)
 
 
 class MemoryStoreTests(unittest.TestCase):
@@ -230,6 +319,129 @@ class ToolLoopGuardTests(unittest.TestCase):
                 {"path": "a.pdf", "page": 1},
             )
             self.assertEqual(count, 1)
+
+    def test_total_tool_call_count_scoped_to_latest_turn(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            agent = LangGraphAgent(
+                db_path=Path(tmp_dir) / "graph.db",
+                llm_client=_DummyLLMClient(),
+                max_iterations=10,
+                request_timeout_seconds=30,
+                tool_timeout_seconds=5,
+            )
+
+            messages = [
+                HumanMessage(content="old turn"),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"id": "old-1", "name": "read_pdf", "args": {"path": "a.pdf", "page": 1}},
+                        {"id": "old-2", "name": "read_pdf", "args": {"path": "a.pdf", "page": 2}},
+                    ],
+                ),
+                ToolMessage(content="old result", tool_call_id="old-1"),
+                HumanMessage(content="new turn"),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"id": "new-1", "name": "read_pdf", "args": {"path": "a.pdf", "page": 1}},
+                        {"id": "new-2", "name": "read_pdf", "args": {"path": "a.pdf", "page": 2}},
+                    ],
+                ),
+            ]
+
+            count = agent._count_total_tool_calls_current_turn(messages)
+            self.assertEqual(count, 2)
+
+    def test_filesystem_access_denied_is_non_retryable(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            agent = LangGraphAgent(
+                db_path=Path(tmp_dir) / "graph.db",
+                llm_client=_DummyLLMClient(),
+                max_iterations=10,
+                request_timeout_seconds=30,
+                tool_timeout_seconds=5,
+            )
+
+            self.assertTrue(
+                agent._is_non_retryable_tool_error(
+                    "list_directory",
+                    "Access denied - path outside allowed directories: /a not in /b",
+                )
+            )
+            self.assertFalse(
+                agent._is_non_retryable_tool_error(
+                    "web_search",
+                    "Request timed out",
+                )
+            )
+
+    def test_emit_tool_event_payload_shape(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            agent = LangGraphAgent(
+                db_path=Path(tmp_dir) / "graph.db",
+                llm_client=_DummyLLMClient(),
+                max_iterations=10,
+                request_timeout_seconds=30,
+                tool_timeout_seconds=5,
+            )
+
+            events: list[object] = []
+            agent._emit_tool_event(
+                events.append,
+                "list_directory",
+                {"path": "/tmp"},
+                "ERROR",
+            )
+
+            self.assertEqual(len(events), 1)
+            self.assertIsInstance(events[0], dict)
+            payload = events[0]
+            self.assertEqual(payload.get("tool_name"), "list_directory")
+            self.assertEqual(payload.get("status"), "ERROR")
+
+    def test_tool_signature_ignores_runtime_arg_injection(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            agent = LangGraphAgent(
+                db_path=Path(tmp_dir) / "graph.db",
+                llm_client=_DummyLLMClient(),
+                max_iterations=10,
+                request_timeout_seconds=30,
+                tool_timeout_seconds=5,
+            )
+
+            sig_a = agent._tool_call_signature(
+                "browser_navigate",
+                {
+                    "url": "https://mail.google.com",
+                    "run_manager": object(),
+                    "config": {"thread_id": "request-a"},
+                },
+            )
+            sig_b = agent._tool_call_signature(
+                "browser_navigate",
+                {
+                    "url": "https://mail.google.com",
+                    "run_manager": object(),
+                    "config": {"thread_id": "request-b"},
+                },
+            )
+            self.assertEqual(sig_a, sig_b)
+
+    def test_stringify_tool_result_truncates_large_payloads(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            agent = LangGraphAgent(
+                db_path=Path(tmp_dir) / "graph.db",
+                llm_client=_DummyLLMClient(),
+                max_iterations=10,
+                request_timeout_seconds=30,
+                tool_timeout_seconds=5,
+            )
+
+            raw = "x" * (MAX_TOOL_RESULT_CHARS + 123)
+            rendered = agent._stringify_tool_result(raw)
+            self.assertIn("[tool output truncated:", rendered)
+            self.assertLess(len(rendered), len(raw))
 
 
 if __name__ == "__main__":

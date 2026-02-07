@@ -355,6 +355,7 @@ class AssistantTUI(App):
         self.mcp_manager = MCPManager(
             config_path=self.settings.mcp_config_path,
             fallback_config_path=self.settings.mcp_fallback_config_path,
+            connect_timeout_seconds=self.settings.mcp_connect_timeout_seconds,
         )
         self.skill_manager = SkillManager(
             skill_dirs=self.settings.skill_dirs,
@@ -469,7 +470,15 @@ class AssistantTUI(App):
             # but explicit scroll often helps.
             loop.call_soon_threadsafe(container.scroll_end, animate=False)
 
-        def on_tool(tool_name: str):
+        def on_tool(event: object):
+            tool_name = "tool"
+            if isinstance(event, dict):
+                raw_name = event.get("tool_name")
+                if isinstance(raw_name, str) and raw_name:
+                    tool_name = raw_name
+            elif isinstance(event, str) and event:
+                tool_name = event
+
             card = ToolCard(tool_name)
             self._current_tool_cards.append(card)
             loop.call_soon_threadsafe(container.mount, card)

@@ -14,7 +14,6 @@ from typing import Annotated, Awaitable, Callable, TypedDict
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
@@ -25,6 +24,9 @@ from assistant_cli.skills_manager import SkillManager
 
 LOGGER = logging.getLogger(__name__)
 MAX_IDENTICAL_TOOL_CALLS_PER_TURN = 2
+MAX_TOTAL_TOOL_CALLS_PER_TURN = 8
+MAX_TOOL_RESULT_CHARS = 12000
+INTERNAL_TOOL_ARG_KEYS = {"run_manager", "callbacks", "config"}
 SYSTEM_PROMPT_PATH = Path(__file__).resolve().parents[1] / "anton-0.1.md"
 
 
@@ -33,12 +35,14 @@ def _build_system_prompt(tool_names: list[str], skills_prompt: str) -> str:
     now_timestamp = now.strftime("%Y-%m-%d %H:%M:%S %Z")
     current_date = now.strftime("%A, %B %d, %Y")
     os_info = platform.platform()
+    current_working_directory = str(Path.cwd())
     tool_list = ", ".join(sorted(tool_names)) if tool_names else "none"
     template = _load_system_prompt_template()
     rendered = (
         template.replace("{{currentDateTime}}", now_timestamp)
         .replace("{{current_date}}", current_date)
         .replace("{{osInfo}}", os_info)
+        .replace("{{currentWorkingDirectory}}", current_working_directory)
         .replace("{{toolList}}", tool_list)
     )
     if "{{skillsList}}" in rendered:
@@ -61,7 +65,7 @@ def _load_system_prompt_template() -> str:
             "(plans, constraints, intermediate results) and retrieve them before continuing. "
             "Do not assume long-term memory is in context unless explicitly retrieved. "
             "Return concise final answers and never expose hidden reasoning. "
-            "Runtime context: current_time={{currentDateTime}}; os={{osInfo}}. "
+            "Runtime context: current_time={{currentDateTime}}; os={{osInfo}}; cwd={{currentWorkingDirectory}}. "
             "Available tools: {{toolList}}."
         )
 
@@ -104,8 +108,6 @@ class LangGraphAgent:
         self._db_path = db_path
         self._skill_manager = skill_manager
 
-        self._checkpointer_cm: AsyncSqliteSaver | None = None
-        self._checkpointer: AsyncSqliteSaver | None = None
         self._graph = None
 
     def set_llm_client(self, llm_client: LLMClient) -> None:
@@ -114,19 +116,12 @@ class LangGraphAgent:
     async def _ensure_graph(self) -> None:
         if self._graph is not None:
             return
-        self._checkpointer_cm = AsyncSqliteSaver.from_conn_string(str(self._db_path))
-        self._checkpointer = await self._checkpointer_cm.__aenter__()
-        self._graph = self._build_graph(self._checkpointer)
+        self._graph = self._build_graph()
 
     async def aclose(self) -> None:
-        if self._checkpointer_cm is None:
-            return
-        await self._checkpointer_cm.__aexit__(None, None, None)
-        self._checkpointer_cm = None
-        self._checkpointer = None
         self._graph = None
 
-    def _build_graph(self, checkpointer: AsyncSqliteSaver):
+    def _build_graph(self):
         workflow = StateGraph(AgentState)
         workflow.add_node("router", self._router_node)
         workflow.add_node("tool_executor", self._tool_executor_node)
@@ -149,7 +144,7 @@ class LangGraphAgent:
             },
         )
 
-        return workflow.compile(checkpointer=checkpointer)
+        return workflow.compile()
 
     async def _router_node(self, state: AgentState, config: RunnableConfig) -> dict:
         iteration = state.get("iteration", 0)
@@ -277,7 +272,7 @@ class LangGraphAgent:
         tools: dict[str, BaseTool] = config["configurable"]["tools"]
         approval_manager: ApprovalManager = config["configurable"]["approval_manager"]
         input_fn: Callable[[str], str] = config["configurable"].get("input_fn", input)
-        tool_event_callback: Callable[[str], None] | None = config["configurable"].get(
+        tool_event_callback: Callable[[object], None] | None = config["configurable"].get(
             "tool_event_callback"
         )
         approval_prompt: Callable[[str, dict], Awaitable[bool]] | None = config["configurable"].get(
@@ -292,15 +287,30 @@ class LangGraphAgent:
         if not tool_calls:
             return {}
 
+        total_calls_current_turn = self._count_total_tool_calls_current_turn(state["messages"])
+        if total_calls_current_turn + len(tool_calls) > MAX_TOTAL_TOOL_CALLS_PER_TURN:
+            return {
+                "stop_reason": "tool_loop_detected",
+                "messages": [
+                    AIMessage(
+                        content=(
+                            "I stopped because this turn triggered too many tool calls without converging. "
+                            "Please narrow the request or provide a specific allowed path and try again."
+                        )
+                    )
+                ],
+            }
+
         tool_messages: list[ToolMessage] = []
 
         for call in tool_calls:
             tool_name = call["name"]
             raw_tool_args = call.get("args") or {}
             tool_args = deepcopy(raw_tool_args)
+            event_args = self._sanitize_tool_args(tool_args)
             tool_call_id = call.get("id") or str(uuid.uuid4())
             repeated_count = self._count_tool_call_occurrences_current_turn(
-                state["messages"], tool_name, tool_args
+                state["messages"], tool_name, event_args
             )
             if repeated_count > MAX_IDENTICAL_TOOL_CALLS_PER_TURN:
                 return {
@@ -315,14 +325,9 @@ class LangGraphAgent:
                         )
                     ],
                 }
-            if tool_event_callback:
-                try:
-                    tool_event_callback(tool_name)
-                except Exception:  # noqa: BLE001
-                    LOGGER.debug("Tool event callback failed", exc_info=True)
-
             tool = tools.get(tool_name)
             if tool is None:
+                self._emit_tool_event(tool_event_callback, tool_name, event_args, status="ERROR")
                 tool_messages.append(
                     ToolMessage(
                         tool_call_id=tool_call_id,
@@ -333,20 +338,23 @@ class LangGraphAgent:
 
             approved = await approval_manager.request_approval(
                 tool_name=tool_name,
-                payload=tool_args,
+                payload=event_args if isinstance(event_args, dict) else {"args": event_args},
                 input_fn=input_fn,
                 approval_prompt=approval_prompt,
             )
             if not approved:
+                self._emit_tool_event(tool_event_callback, tool_name, event_args, status="ERROR")
                 return {
                     "stop_reason": "tool_rejected",
                 }
 
             try:
+                self._emit_tool_event(tool_event_callback, tool_name, event_args, status="RUNNING")
                 result = await asyncio.wait_for(
                     tool.ainvoke(tool_args),
                     timeout=float(config["configurable"]["tool_timeout_seconds"]),
                 )
+                self._emit_tool_event(tool_event_callback, tool_name, event_args, status="OK")
                 tool_messages.append(
                     ToolMessage(
                         tool_call_id=tool_call_id,
@@ -354,6 +362,7 @@ class LangGraphAgent:
                     )
                 )
             except TimeoutError:
+                self._emit_tool_event(tool_event_callback, tool_name, event_args, status="ERROR")
                 tool_messages.append(
                     ToolMessage(
                         tool_call_id=tool_call_id,
@@ -362,12 +371,24 @@ class LangGraphAgent:
                 )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.error("Tool call failed: %s (%s)", tool_name, exc)
+                error_text = str(exc)
+                self._emit_tool_event(tool_event_callback, tool_name, event_args, status="ERROR")
                 tool_messages.append(
                     ToolMessage(
                         tool_call_id=tool_call_id,
-                        content=f"Tool '{tool_name}' failed: {exc}",
+                        content=f"Tool '{tool_name}' failed: {error_text}",
                     )
                 )
+                if self._is_non_retryable_tool_error(tool_name, error_text):
+                    return {
+                        "stop_reason": "tool_error_non_retryable",
+                        "messages": [
+                            *tool_messages,
+                            AIMessage(
+                                content=self._format_non_retryable_tool_error(tool_name, error_text)
+                            ),
+                        ],
+                    }
 
         return {"messages": tool_messages}
 
@@ -392,11 +413,18 @@ class LangGraphAgent:
 
     def _stringify_tool_result(self, result: object) -> str:
         if isinstance(result, str):
-            return result
-        try:
-            return json.dumps(result, ensure_ascii=False, indent=2)
-        except TypeError:
-            return str(result)
+            text = result
+        else:
+            try:
+                text = json.dumps(result, ensure_ascii=False, indent=2)
+            except TypeError:
+                text = str(result)
+
+        if len(text) > MAX_TOOL_RESULT_CHARS:
+            clipped = text[:MAX_TOOL_RESULT_CHARS]
+            omitted = len(text) - MAX_TOOL_RESULT_CHARS
+            return f"{clipped}\n\n[tool output truncated: {omitted} chars omitted]"
+        return text
 
     async def run(
         self,
@@ -405,7 +433,7 @@ class LangGraphAgent:
         approval_manager: ApprovalManager,
         input_fn: Callable[[str], str] = input,
         stream_callback: Callable[[str], None] | None = None,
-        tool_event_callback: Callable[[str], None] | None = None,
+        tool_event_callback: Callable[[object], None] | None = None,
         approval_prompt: Callable[[str, dict], Awaitable[bool]] | None = None,
     ) -> AgentRunResult:
         await self._ensure_graph()
@@ -556,9 +584,87 @@ class LangGraphAgent:
         recent.reverse()
         return recent
 
+    def _count_total_tool_calls_current_turn(self, messages: list[BaseMessage]) -> int:
+        count = 0
+        for message in self._messages_in_current_turn(messages):
+            if isinstance(message, AIMessage) and message.tool_calls:
+                count += len(message.tool_calls)
+        return count
+
     def _tool_call_signature(self, tool_name: str, tool_args: object) -> str:
+        sanitized_args = self._sanitize_tool_args(tool_args)
         try:
-            payload = json.dumps(tool_args, sort_keys=True, ensure_ascii=False)
+            payload = json.dumps(sanitized_args, sort_keys=True, ensure_ascii=False)
         except TypeError:
-            payload = str(tool_args)
+            payload = str(sanitized_args)
         return f"{tool_name}:{payload}"
+
+    def _is_non_retryable_tool_error(self, tool_name: str, error_text: str) -> bool:
+        lowered_tool = tool_name.lower()
+        lowered_error = error_text.lower()
+        is_filesystem_tool = any(
+            marker in lowered_tool
+            for marker in (
+                "list_directory",
+                "read_file",
+                "write_file",
+                "filesystem",
+            )
+        )
+        has_permission_denied = any(
+            marker in lowered_error
+            for marker in (
+                "access denied",
+                "permission denied",
+                "outside allowed directories",
+            )
+        )
+        return is_filesystem_tool and has_permission_denied
+
+    def _format_non_retryable_tool_error(self, tool_name: str, error_text: str) -> str:
+        lowered_error = error_text.lower()
+        if "outside allowed directories" in lowered_error:
+            return (
+                f"`{tool_name}` was blocked by filesystem path restrictions. "
+                "Use `/paths` to view allowed directories, then `/paths add <directory>` "
+                "or run the request against a currently allowed path and retry."
+            )
+        return (
+            f"`{tool_name}` failed due to a non-retryable permission error. "
+            "Adjust filesystem permissions/allowed paths, then retry."
+        )
+
+    def _emit_tool_event(
+        self,
+        callback: Callable[[object], None] | None,
+        tool_name: str,
+        tool_args: object,
+        status: str,
+    ) -> None:
+        if callback is None:
+            return
+        payload = {
+            "tool_name": tool_name,
+            "args": tool_args,
+            "status": status,
+        }
+        try:
+            callback(payload)
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Tool event callback failed", exc_info=True)
+
+    def _sanitize_tool_args(self, value: object) -> object:
+        if isinstance(value, dict):
+            sanitized: dict[str, object] = {}
+            for key, item in value.items():
+                if key in INTERNAL_TOOL_ARG_KEYS:
+                    continue
+                sanitized[key] = self._sanitize_tool_args(item)
+            return sanitized
+        if isinstance(value, list):
+            return [self._sanitize_tool_args(item) for item in value]
+        if isinstance(value, tuple):
+            return [self._sanitize_tool_args(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return f"<{type(value).__name__}>"

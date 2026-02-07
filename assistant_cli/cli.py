@@ -47,6 +47,7 @@ LOGGER = logging.getLogger(__name__)
 CSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 OSC_ESCAPE_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 IMAGE_TAG_RE = re.compile(r"\[Image #\d+\]")
+STREAM_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 MARKDOWN_BLOCK_RE = re.compile(r"(^|\n)\s{0,3}(#{1,6}\s|[-*+]\s|>\s|\d+\.\s|```|~~~)")
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\([^)]+\)")
 TABLE_SEPARATOR_RE = re.compile(r"(^|\n)\s*\|?[:\- ]+\|[:\-| ]*(\n|$)")
@@ -131,11 +132,13 @@ class ResponseStreamPrinter:
         self._line_open = False
         self._saw_visible_token = False
         self._line_started = False
+        self._tool_events = 0
 
     def on_token(self, token: str) -> None:
         if not token:
             return
-        cleaned = _strip_ansi_codes(token)
+        cleaned = _strip_ansi_codes(token).replace("\r", "")
+        cleaned = STREAM_CONTROL_RE.sub("", cleaned)
         if not cleaned:
             return
         if not self._line_open:
@@ -151,9 +154,10 @@ class ResponseStreamPrinter:
         if cleaned.strip():
             self._saw_visible_token = True
 
-    def on_tool(self, tool_name: str) -> None:
+    def on_tool(self, event: object) -> None:
         self._close_line_if_needed()
-        sys.stdout.write(f"tool> {tool_name}\n")
+        self._tool_events += 1
+        sys.stdout.write(self._format_tool_event(event) + "\n")
         sys.stdout.flush()
 
     def finish(self) -> None:
@@ -162,6 +166,10 @@ class ResponseStreamPrinter:
     @property
     def saw_token(self) -> bool:
         return self._saw_visible_token
+
+    @property
+    def tool_event_count(self) -> int:
+        return self._tool_events
 
     def _close_line_if_needed(self) -> None:
         if self._line_open:
@@ -172,6 +180,27 @@ class ResponseStreamPrinter:
             sys.stdout.write("\n")
             sys.stdout.flush()
 
+    def _format_tool_event(self, event: object) -> str:
+        if not isinstance(event, dict):
+            return f"tool> {event}"
+
+        tool_name = str(event.get("tool_name") or "unknown_tool")
+        args = event.get("args")
+        status = str(event.get("status") or "").upper()
+
+        args_text = ""
+        if args is not None:
+            try:
+                rendered_args = json.dumps(args, ensure_ascii=False, sort_keys=True)
+            except TypeError:
+                rendered_args = str(args)
+            if len(rendered_args) > 300:
+                rendered_args = rendered_args[:297] + "..."
+            args_text = f" args={rendered_args}"
+
+        status_text = f" output={status}" if status else ""
+        return f"tool> {tool_name}{args_text}{status_text}"
+
 
 class AssistantCLI:
     def __init__(self) -> None:
@@ -181,6 +210,7 @@ class AssistantCLI:
         self.current_model = self.settings.ollama_model
         self._pending_images: list[str] = []
         self._markdown_enabled = self._supports_ansi()
+        self._startup_refresh_task: asyncio.Task[bool] | None = None
 
         self.memory_store = SQLiteMemoryStore(
             db_path=self.settings.sqlite_path,
@@ -193,6 +223,7 @@ class AssistantCLI:
         self.mcp_manager = MCPManager(
             config_path=self.settings.mcp_config_path,
             fallback_config_path=self.settings.mcp_fallback_config_path,
+            connect_timeout_seconds=self.settings.mcp_connect_timeout_seconds,
         )
         self.skill_manager = SkillManager(
             skill_dirs=self.settings.skill_dirs,
@@ -482,6 +513,7 @@ class AssistantCLI:
         return False
 
     async def _handle_mcp_command(self, args: Sequence[str]) -> None:
+        await self._await_startup_refresh_if_pending()
         if not args:
             self._print_mcp_status()
             return
@@ -509,6 +541,7 @@ class AssistantCLI:
         self.console.print("Usage: /mcp | /mcp refresh | /mcp on <server> | /mcp off <server>")
 
     async def _handle_paths_command(self, args: Sequence[str]) -> None:
+        await self._await_startup_refresh_if_pending()
         if not args or args[0].lower() == "list":
             self._print_allowed_paths()
             return
@@ -1026,6 +1059,7 @@ class AssistantCLI:
         return []
 
     async def _handle_user_message(self, user_input: str) -> None:
+        await self._await_startup_refresh_if_pending()
         if self._pending_images:
             cleaned = IMAGE_TAG_RE.sub("", user_input).strip()
             content: list[dict[str, object]] = []
@@ -1048,24 +1082,21 @@ class AssistantCLI:
         tool_map = {tool.name: tool for tool in self.mcp_manager.active_tools()}
 
         try:
-            if self._markdown_enabled:
-                result = await self.agent.run(
-                    messages=initial_messages,
-                    tools=tool_map,
-                    approval_manager=self.approval_manager,
-                    tool_event_callback=streamer.on_tool,
-                )
-            else:
-                result = await self.agent.run(
-                    messages=initial_messages,
-                    tools=tool_map,
-                    approval_manager=self.approval_manager,
-                    stream_callback=streamer.on_token,
-                    tool_event_callback=streamer.on_tool,
-                )
+            result = await self.agent.run(
+                messages=initial_messages,
+                tools=tool_map,
+                approval_manager=self.approval_manager,
+                stream_callback=streamer.on_token,
+                tool_event_callback=streamer.on_tool,
+            )
         except TimeoutError:
             streamer.finish()
-            self.console.print("Assistant request timed out.")
+            if streamer.tool_event_count > 0:
+                self.console.print(
+                    f"Assistant request timed out after {streamer.tool_event_count} tool events."
+                )
+            else:
+                self.console.print("Assistant request timed out.")
             self.memory_store.save_messages(initial_messages, truncation_occurred=pre_truncation)
             return
         except Exception as exc:  # noqa: BLE001
@@ -1086,7 +1117,7 @@ class AssistantCLI:
             return
 
         streamer.finish()
-        if self._markdown_enabled:
+        if not streamer.saw_token and self._markdown_enabled:
             final_answer = result.final_answer or ""
             if self._looks_like_markdown(final_answer):
                 self._print_markdown_response(final_answer)
@@ -1124,48 +1155,78 @@ class AssistantCLI:
             self.console.print(f"MCP refresh failed during {reason}: {exc}")
             return False
 
+    async def _await_startup_refresh_if_pending(self) -> None:
+        task = self._startup_refresh_task
+        if task is None:
+            return
+        if task.done():
+            with suppress(asyncio.CancelledError, Exception):
+                task.result()
+            self._startup_refresh_task = None
+            return
+
+        self.console.print("Finalizing MCP startup refresh...")
+        try:
+            await task
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Startup MCP refresh task failed", exc_info=True)
+        finally:
+            self._startup_refresh_task = None
+
     async def aclose(self) -> None:
+        task = self._startup_refresh_task
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+            self._startup_refresh_task = None
         await self.agent.aclose()
         await self.mcp_manager.aclose()
 
     async def run(self) -> None:
-        await self._safe_refresh_mcp("startup")
         self._print_welcome()
+        self._startup_refresh_task = asyncio.create_task(self._safe_refresh_mcp("startup"))
 
-        with patch_stdout():
-            while True:
-                self._clear_current_task_cancellation()
-                try:
-                    # Minimal Prompt
+        while True:
+            self._clear_current_task_cancellation()
+            try:
+                # Keep prompt-toolkit stdout patching scoped to prompt input only.
+                # Streaming output is printed outside this context to avoid redraw erasing.
+                with patch_stdout():
                     raw = await self._prompt("• ", multiline=True)
-                except EOFError:
-                    self.console.print("Goodbye.")
+            except EOFError:
+                self.console.print("Goodbye.")
+                break
+            except KeyboardInterrupt:
+                continue
+
+            user_input = raw.strip()
+            if not user_input:
+                continue
+
+            if user_input.startswith("/"):
+                try:
+                    should_exit = await self._handle_command(user_input)
+                except asyncio.CancelledError:
+                    self._clear_current_task_cancellation()
+                    self.console.print("Command was interrupted internally. You can continue.")
+                    should_exit = False
+                if should_exit:
                     break
-                except KeyboardInterrupt:
-                    continue
+                continue
 
-                user_input = raw.strip()
-                if not user_input:
-                    continue
-
-                if user_input.startswith("/"):
-                    try:
-                        should_exit = await self._handle_command(user_input)
-                    except asyncio.CancelledError:
-                        self._clear_current_task_cancellation()
-                        self.console.print("Command was interrupted internally. You can continue.")
-                        should_exit = False
-                    if should_exit:
-                        break
-                    continue
-
-                await self._handle_user_message(user_input)
+            await self._handle_user_message(user_input)
 
 
 async def _run_with_cleanup(app: AssistantCLI) -> None:
     try:
         await app.run()
     finally:
+        # Ensure cleanup can finish even if the outer task was cancelled.
+        task = asyncio.current_task()
+        if task is not None:
+            while task.cancelling():
+                task.uncancel()
         await app.aclose()
 
 

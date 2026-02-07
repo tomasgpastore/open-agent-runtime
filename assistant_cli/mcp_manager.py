@@ -59,9 +59,15 @@ class MCPServerStatus:
 class MCPManager:
     """Loads MCP server config and exposes currently-enabled tools."""
 
-    def __init__(self, config_path: Path, fallback_config_path: Path) -> None:
+    def __init__(
+        self,
+        config_path: Path,
+        fallback_config_path: Path,
+        connect_timeout_seconds: float = 12.0,
+    ) -> None:
         self._config_path = config_path
         self._fallback_config_path = fallback_config_path
+        self._connect_timeout_seconds = max(1.0, float(connect_timeout_seconds))
         self._servers: dict[str, MCPServerConfig] = self._load_server_configs()
         self._connected: dict[str, bool] = {name: False for name in self._servers}
         self._tools_by_server: dict[str, list[BaseTool]] = {name: [] for name in self._servers}
@@ -137,39 +143,62 @@ class MCPManager:
         self._tools_by_server = {name: [] for name in self._servers}
         self._tool_registry = {}
         self._last_errors = {name: None for name in self._servers}
-
+        tasks: list[asyncio.Task[None]] = []
         for name, cfg in self._servers.items():
             if not cfg.enabled:
                 continue
+            tasks.append(asyncio.create_task(self._connect_server(name, cfg)))
 
-            client = MultiServerMCPClient({name: cfg.to_connection_dict()})
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def _connect_server(self, name: str, cfg: MCPServerConfig) -> None:
+        client = MultiServerMCPClient({name: cfg.to_connection_dict()})
+        try:
+            await asyncio.wait_for(client.__aenter__(), timeout=self._connect_timeout_seconds)
+            tools = await asyncio.wait_for(
+                self._load_tools_for_client(client),
+                timeout=self._connect_timeout_seconds,
+            )
+            self._connected[name] = True
+            self._tools_by_server[name] = tools
+            self._clients[name] = client
+            for tool in tools:
+                self._tool_registry[tool.name] = tool
+        except TimeoutError:
+            LOGGER.warning(
+                "MCP server '%s' connection timed out after %.1fs",
+                name,
+                self._connect_timeout_seconds,
+            )
+            self._connected[name] = False
+            self._tools_by_server[name] = []
+            self._last_errors[name] = (
+                f"Connection timed out after {self._connect_timeout_seconds:.1f}s."
+            )
             try:
-                await client.__aenter__()
-                tools = await self._load_tools_for_client(client)
-                self._connected[name] = True
-                self._tools_by_server[name] = tools
-                self._clients[name] = client
-                for tool in tools:
-                    self._tool_registry[tool.name] = tool
-            except asyncio.CancelledError as exc:
-                self._clear_current_task_cancellation()
-                LOGGER.debug("Connection setup cancelled for MCP server '%s': %s", name, exc)
-                self._connected[name] = False
-                self._tools_by_server[name] = []
-                self._last_errors[name] = "Connection setup cancelled."
-                try:
-                    await client.__aexit__(None, None, None)
-                except Exception:  # noqa: BLE001
-                    pass
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("Failed to connect MCP server '%s': %s", name, exc)
-                self._connected[name] = False
-                self._tools_by_server[name] = []
-                self._last_errors[name] = str(exc)
-                try:
-                    await client.__aexit__(None, None, None)
-                except Exception:  # noqa: BLE001
-                    pass
+                await client.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+        except asyncio.CancelledError as exc:
+            self._clear_current_task_cancellation()
+            LOGGER.debug("Connection setup cancelled for MCP server '%s': %s", name, exc)
+            self._connected[name] = False
+            self._tools_by_server[name] = []
+            self._last_errors[name] = "Connection setup cancelled."
+            try:
+                await client.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Failed to connect MCP server '%s': %s", name, exc)
+            self._connected[name] = False
+            self._tools_by_server[name] = []
+            self._last_errors[name] = str(exc)
+            try:
+                await client.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _load_tools_for_client(self, client: MultiServerMCPClient) -> list[BaseTool]:
         try:
