@@ -1,11 +1,11 @@
-# LangGraph MCP Assistant
+# Anton v0.2 Runtime
 
-Production-quality Python CLI personal assistant using:
+Production-quality Python CLI coworker agent runtime using:
 - **LangGraph** for controlled multi-tool agent orchestration.
 - **LangChain** wrappers for Ollama and MCP tools.
 - **Remote Ollama over HTTP** as the LLM backend.
 - **MCP servers** as pluggable tools.
-- **SQLite** for short-term memory + LangGraph checkpoints.
+- **SQLite** for short-term memory, long-term memory, and graph checkpoints/state.
 
 ## Features
 
@@ -14,6 +14,8 @@ Production-quality Python CLI personal assistant using:
   - `/approval`
   - `/memory`
   - `/memory daily ...`
+  - `/memory fact ...`
+  - `/memory retrieve ...`
   - `/graph ...`
   - `/skills`
   - `/paths`
@@ -31,6 +33,10 @@ Production-quality Python CLI personal assistant using:
 - Multi-step agent loop with up to 100 tool-iteration cycles by default.
 - Rolling short-term memory budget (20,000 token estimate).
 - 20k context target with explicit budget reporting.
+- Graph Builder Anton (`/graph build`) for intent-to-graph generation.
+- Graph execution modes: `strict`, `bounded`, `flex`.
+- Graph replay/resume with persisted checkpoints.
+- Graph scheduler with cron-like persisted schedules.
 - Guard against repeated identical tool-call loops in a single turn.
 - Optional long-term memory wipe via MCP memory tools on `/new`.
 
@@ -44,7 +50,9 @@ Production-quality Python CLI personal assistant using:
 │   ├── cli.py
 │   ├── daily_memory.py
 │   ├── graph/
+│   ├── cloud/
 │   ├── llm_client.py
+│   ├── long_term_memory.py
 │   ├── logging_utils.py
 │   ├── mcp_manager.py
 │   ├── memory_store.py
@@ -248,13 +256,29 @@ Note: `Cmd+Arrow` usually does not reach terminal apps on macOS unless remapped 
 
 ## Long-term memory behavior
 
-- Long-term memory is provided by MCP memory tools.
-- It is **not automatically injected** into the prompt.
-- Agent prompt instructs the model to explicitly retrieve needed memory via tools.
+- Local long-term facts are stored in SQLite (`long_term_facts`) and managed via:
+  - `/memory fact add|search|get|delete|list|prune`
+- Combined retrieval across daily + long-term memory is available via:
+  - `/memory retrieve <query>`
+- MCP memory tools remain optional for external graph-memory workflows.
 - `/new` clears short-term memory and asks:
   - `Also clear long-term memory, yes or no?`
 - If yes, assistant tries to wipe entities and relations from memory graph safely.
   - Wipe uses currently active MCP memory tools (no forced reconnect).
+
+## Graph runtime v0.2
+
+- Graph definitions are validated and persisted in SQLite.
+- Node types include:
+  - `start`, `end`, `transform`, `tool`, `ai_template`, `condition`
+  - `read_state`, `write_state`, `read_prior_runs`
+- Every node takes input and emits output; output is available to downstream nodes.
+- State nodes persist and retrieve graph-level execution state across runs.
+- Reliability controls:
+  - checkpoint per step
+  - replay from prior runs (`/graph replay`)
+  - resume from failure checkpoints (`/graph resume`)
+  - scheduler for recurring runs (`/graph schedule ...`)
 
 ## Agent loop details
 

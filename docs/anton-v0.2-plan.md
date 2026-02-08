@@ -1,138 +1,127 @@
-# Anton v0.2 Plan
+# Anton v0.2 Specification (Implemented)
 
-## Vision
-Anton v0.2 is a graph-centric coworker agent platform with three coordinated agents:
-- General Anton for day-to-day assistance
-- Graph Builder Anton for automation graph generation
-- Error Handler Anton for policy-bounded remediation
+## Summary
+Anton v0.2 is implemented as a local-first coworker agent runtime with three coordinated systems:
+- General Anton: conversational agent with MCP tools, skills, approvals, and streaming output.
+- Graph Builder Anton: intent-to-graph generator that outputs validated Anton graph JSON.
+- Error Handler Anton: bounded runtime remediation (retry/fallback/fail policy).
 
-The core differentiator is controlled tool orchestration through graph execution with strong reliability, explicit state, and auditable runs.
+The v0.2 differentiator is controlled automation through deterministic graph execution with persistent run state, checkpoints, replay/resume, scheduling, and memory-backed state nodes.
 
-## Scope (Milestone 1)
-- Local-first runtime with cloud-ready interfaces
-- Internal graph JSON schema and runtime validation
-- Graph state memory for prior-run and key-value state access
-- Guarantee modes per run: `strict`, `bounded`, `flex`
-- Explicit state nodes only: `read_state`, `write_state`, `read_prior_runs`
-- Condition nodes supporting:
-  - typed operators
-  - schema-constrained enum LLM branching
-- Hybrid scheduling design (in-app scheduler + external trigger contracts)
-- CLI/TUI-first control surface
+## Scope Completed
+- MCP + skills + hooks integrated in runtime.
+- Graph execution engine with validation, policy gates, and typed node runtime.
+- Graph state memory persisted in SQLite (run history + key/value state + checkpoints + events).
+- Guarantee modes: `strict`, `bounded`, `flex`.
+- Graph scheduler (cron-style) with persisted schedules and manual/automatic triggers.
+- Long-term memory store and daily archive retrieval planner.
+- CLI control surface for graph build/run/replay/resume/state/schedule and memory operations.
 
 ## Memory Architecture
-### Hot State
-- System prompt
-- Persona
-- Rolling short-term conversation memory
-- Active execution context
+
+### Hot State (short-term)
+- System prompt + Anton persona.
+- Rolling conversation memory in SQLite.
+- Active execution context for current turn/graph run.
 
 ### Cold State
-- Daily chat archives as `.md` files per day
-- Chunking/indexing target:
-  - 400-token chunks
-  - 80-token overlap
-- Long-term fact memory with retrieval by keyword and semantic lookup
+- Daily chat archive (`data/memory/daily/YYYY-MM-DD.md`) with chunk indexing.
+- Long-term fact store (`long_term_facts`) with namespace, importance, TTL, prune, and retrieval.
 
-## Graph State Memory
-- Scope: same-graph prior state only
-- Default: prior-state access disabled unless explicit node enables it
-- State reads and writes must happen through dedicated state nodes
-- Every node keeps typed input/output contracts
+### Retrieval Model
+- Combined retrieval path (`/memory retrieve`) merges:
+  - daily archive hits
+  - long-term fact hits
+- Ranking favors high-importance long-term facts while still returning daily-context hits.
 
-## Execution Guarantee Modes
-### strict
-- Highest predictability
-- Blocks unsafe constructs
-- Requires strong schema and policy compliance
+## Graph Runtime Contract
 
-### bounded
-- Controlled flexibility
-- Allows constrained LLM branching and bounded remediations
+### Node I/O
+Yes: every node consumes input and produces output.
+- Default node input: previous node output (`last`).
+- Node input can be explicitly templated from context (`{{input.foo}}`, `{{node_id.bar}}`, etc.).
+- Node output is stored in context under its `node_id` and becomes `last` for next node.
 
-### flex
-- Maximum autonomy
-- Broader behavior allowed with weaker reproducibility guarantees
+### State Nodes
+State nodes follow the same input/output contract and are persisted across executions:
+- `read_state`: reads durable graph key/value state.
+- `write_state`: writes durable graph key/value state.
+- `read_prior_runs`: reads prior run metadata for the same graph.
 
-## Data Contracts (Initial)
-- `graph.schema.json` for graph definition validation
-- Run/audit persistence:
-  - `graph_runs`
-  - `graph_checkpoints`
-  - `graph_state_kv`
-  - `graph_events`
+This enables conditional flows based on prior graph state and historical executions.
 
-## Initial Delivery Steps
-1. Add graph package scaffold (`schema`, `state_store`, `executor`)
-2. Add CLI `/graph` commands for validate/run/state inspection
-3. Add guarantee mode enforcement and state-node execution
-4. Add tests for schema validation, state persistence, and mode policy checks
-5. Add follow-up milestones for graph builder agent, scheduler, and cloud adapters
+## Guarantee Modes
 
-## Constraints
-- No direct graph-state mutation from tool or AI nodes
-- Validation and policy gates must run before execution
-- Every run must be auditable and replay-debuggable via checkpoints
+### `strict`
+- Highest determinism.
+- For `tool` and `ai_template` nodes requires:
+  - `idempotency_key`
+  - `timeout_seconds`
+  - `max_retries`
+- `llm_condition` is constrained and must provide valid branch options.
+- Best for repeatable automation with minimal runtime ambiguity.
 
-## Current Status (Implemented)
-- Graph runtime scaffold exists (`schema`, `state_store`, `executor`).
-- `/graph` CLI supports `list`, `save`, `validate`, `show`, `run`, `runs`, and `state` inspection.
-- Execution guarantee modes are wired: `strict`, `bounded`, `flex`.
-- State-aware nodes are wired: `read_state`, `write_state`, `read_prior_runs`.
-- Daily memory baseline is implemented:
-  - append-only `.md` files per day
-  - token chunking with overlap
-  - CLI retrieval (`/memory daily days`, `/memory daily search`)
+### `bounded`
+- Balanced mode.
+- Requires bounded runtime controls (`timeout_seconds`, `max_retries`) on executable nodes.
+- Allows constrained LLM branching with safe fallbacks.
+- Recommended default.
 
-## Next Steps (Immediate)
-1. Replace `mock_output` execution for `tool` and `ai_template` nodes with real runtime adapters.
-2. Integrate Graph Builder Anton to generate schema-valid graph JSON from intent.
-3. Add run replay and checkpoint resume controls in CLI (`/graph replay`, `/graph resume`).
-4. Add stronger policy enforcement for strict mode (idempotency, timeouts, retry caps per node).
-5. Expand graph tests with failure injection and replay determinism checks.
+### `flex`
+- Highest autonomy.
+- Looser constraints; allows explicit node fallback outputs where configured.
+- Useful for exploratory automations where determinism is less strict.
 
-## Deferred v0.2 Backlog (Implement Later)
-### Agent Layer
-- Graph Builder Anton:
-  - constrained output to internal graph schema
-  - template registry for AI nodes
-  - iterative edit flow for user-directed node changes
-- Error Handler Anton:
-  - policy/runbook-driven remediation only
-  - bounded retry/backoff and escalation decisions
-  - no unrestricted autonomous actions
+## Branching Model
+Branching is configured by condition nodes:
+- `typed_condition`: operator-based deterministic branching (`eq`, `gt`, `contains`, etc.).
+- `llm_condition`: schema-constrained branch selection from `branch_options`.
 
-### Graph UX
-- Graph renderer in UI for node/edge visualization.
-- Node-level editing from UI and prompt-based graph patching.
-- Graph diff/history view before execution.
+Interpretation by mode:
+- `strict`: prefer deterministic/validated branching, tighter enforcement.
+- `bounded`: deterministic + constrained LLM branching.
+- `flex`: allows broader LLM-mediated behavior with fallback pathways.
 
-### Scheduler and Automation
-- Full in-app scheduler (cron-like) persisted in SQLite.
-- External trigger endpoint/command contracts for hybrid orchestration.
-- Scheduled run audit logs and failure notifications.
+## Execution Reliability
+- Runtime validation before execution.
+- Checkpoint written at each node transition.
+- Error checkpoints persisted for resume.
+- Replay support from prior run inputs.
+- Resume support from last failed checkpoint context.
+- Hook lifecycle events:
+  - `before_run`
+  - `after_run`
+  - `before_node`
+  - `after_node`
+  - `on_error`
 
-### Memory v0.2 Expansion
-- Long-term fact memory lifecycle:
-  - extraction rules
-  - update/merge
-  - expiry/pruning of stale facts
-- Semantic retrieval upgrade path:
-  - keep local baseline now
-  - add pluggable embedding index backends later
-- Retrieval planner across hot state, daily archive, and long-term facts.
+## CLI Surface (v0.2)
 
-### Hooks
-- Lifecycle hooks implementation:
-  - before_run
-  - after_run
-  - before_node
-  - after_node
-  - on_error
-- Hook safety model and side-effect boundaries.
+### Graph
+- `/graph build <intent>`
+- `/graph validate <path|graph_id>`
+- `/graph show <path|graph_id>`
+- `/graph render <path|graph_id>`
+- `/graph patch <graph_id> <node_id> <field> <json_value>`
+- `/graph run <path|graph_id> [--mode strict|bounded|flex] [--input payload.json]`
+- `/graph replay <run_id>`
+- `/graph resume <run_id>`
+- `/graph runs <graph_id> [limit]`
+- `/graph state show|get|history|checkpoints ...`
+- `/graph schedule add|list|on|off|delete|trigger|tick|start|stop ...`
 
-### Cloud Version (Cloud-Ready -> Full Cloud)
-- Hosted MCP execution path with user JWT identity propagation.
-- Encrypted OAuth token storage/retrieval on server side.
-- Cloud run workers so scheduled graphs execute while user machine is offline.
-- Local/cloud execution backend abstraction and compatibility tests.
+### Memory
+- `/memory` (short-term stats)
+- `/memory daily days [limit]`
+- `/memory daily search <query> [--day YYYY-MM-DD] [--limit N]`
+- `/memory fact add|search|get|delete|list|prune ...`
+- `/memory retrieve <query> [--day YYYY-MM-DD] [--limit N]`
+
+## Cloud-Ready Boundary (Implemented in v0.2)
+- Execution backend protocol abstraction.
+- Local backend implementation (`LocalExecutionBackend`) wired to graph executor.
+- Credential/provider protocol contracts for future hosted execution.
+
+## Completion Status
+v0.2 implementation is complete for the local runtime scope described above.
+All core v0.2 capabilities (general agent, graph builder, bounded error handling, stateful graph execution, memory architecture, and scheduling) are implemented and test-covered in this repository.
