@@ -13,6 +13,8 @@ Production-quality Python CLI personal assistant using:
   - `/mcp`
   - `/approval`
   - `/memory`
+  - `/memory daily ...`
+  - `/graph ...`
   - `/skills`
   - `/paths`
   - `/llm`
@@ -40,6 +42,8 @@ Production-quality Python CLI personal assistant using:
 │   ├── agent_graph.py
 │   ├── approval.py
 │   ├── cli.py
+│   ├── daily_memory.py
+│   ├── graph/
 │   ├── llm_client.py
 │   ├── logging_utils.py
 │   ├── mcp_manager.py
@@ -131,6 +135,7 @@ export REQUEST_TIMEOUT_SECONDS="600"
 export MCP_CONNECT_TIMEOUT_SECONDS="12"
 export MCP_CONFIG_PATH="config/mcp_servers.json"
 export ASSISTANT_SQLITE_PATH="data/assistant.db"
+export ANTON_DAILY_MEMORY_DIR="data/memory/daily"
 export ANTON_SKILL_DIRS="skills:~/.codex/skills"
 export SKILL_MAX_PER_TURN="3"
 export SKILL_MAX_CHARS="8000"
@@ -234,6 +239,11 @@ Note: `Cmd+Arrow` usually does not reach terminal apps on macOS unless remapped 
   - model context target (20,000)
   - recent turns kept
   - whether truncation happened in the last turn
+- `/memory daily days [limit]` lists archived day files.
+- `/memory daily search <query> [--day YYYY-MM-DD] [--limit N]` searches indexed daily chunks.
+- Daily archive format:
+  - append-only `.md` files by day under `data/memory/daily`
+  - chunk indexing with token-based overlap for retrieval
 - `/skills` shows Anton's current capabilities, providers, and active tool list.
 
 ## Long-term memory behavior

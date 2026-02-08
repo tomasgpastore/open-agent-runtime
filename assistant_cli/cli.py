@@ -28,6 +28,7 @@ from rich.markdown import Markdown
 
 from assistant_cli.agent_graph import LangGraphAgent
 from assistant_cli.approval import ApprovalManager
+from assistant_cli.daily_memory import DailyMemoryArchive
 from assistant_cli.graph import (
     GraphExecutionError,
     GraphExecutor,
@@ -226,6 +227,10 @@ class AssistantCLI:
             session_id="default",
             token_limit=self.settings.short_term_token_limit,
             context_window=self.settings.model_context_window,
+        )
+        self.daily_memory = DailyMemoryArchive(
+            root_dir=self.settings.daily_memory_dir,
+            db_path=self.settings.sqlite_path,
         )
         self.graph_state_store = GraphStateStore(db_path=self.settings.sqlite_path)
         self.graph_executor = GraphExecutor(state_store=self.graph_state_store)
@@ -503,7 +508,7 @@ class AssistantCLI:
             return False
 
         if command == "/memory":
-            self._handle_memory_command()
+            self._handle_memory_command(parts[1:])
             return False
 
         if command == "/graph":
@@ -676,7 +681,15 @@ class AssistantCLI:
             self.console.print(f"- {status.tool_name}: {required}")
         self.console.print()
 
-    def _handle_memory_command(self) -> None:
+    def _handle_memory_command(self, args: Sequence[str]) -> None:
+        if args and args[0].lower() == "daily":
+            self._handle_daily_memory_command(args[1:])
+            return
+
+        if args:
+            self.console.print("Usage: /memory | /memory daily ...")
+            return
+
         stats = self.memory_store.stats()
         body = (
             f"Estimated tokens in memory: {stats.estimated_tokens}\n"
@@ -689,6 +702,80 @@ class AssistantCLI:
         for line in body.splitlines():
             self.console.print(f"- {line}")
         self.console.print()
+
+    def _handle_daily_memory_command(self, args: Sequence[str]) -> None:
+        if not args:
+            self.console.print("Usage: /memory daily days [limit] | /memory daily search <query> [--day YYYY-MM-DD] [--limit N]")
+            return
+
+        action = args[0].lower()
+        if action == "days":
+            limit = 7
+            if len(args) >= 2:
+                parsed = self._parse_positive_int(args[1])
+                if parsed is None:
+                    self.console.print("Limit must be a positive integer.")
+                    return
+                limit = parsed
+            days = self.daily_memory.recent_days(limit=limit)
+            if not days:
+                self.console.print("No daily memory files found yet.")
+                return
+            self.console.print("Daily Memory Days")
+            for day in days:
+                self.console.print(f"- {day}")
+            self.console.print()
+            return
+
+        if action == "search":
+            if len(args) < 2:
+                self.console.print("Usage: /memory daily search <query> [--day YYYY-MM-DD] [--limit N]")
+                return
+            query = args[1]
+            day: str | None = None
+            limit = 5
+
+            index = 2
+            while index < len(args):
+                token = args[index].lower()
+                if token == "--day":
+                    if index + 1 >= len(args):
+                        self.console.print("Missing value for --day")
+                        return
+                    day = args[index + 1]
+                    index += 2
+                    continue
+                if token == "--limit":
+                    if index + 1 >= len(args):
+                        self.console.print("Missing value for --limit")
+                        return
+                    parsed = self._parse_positive_int(args[index + 1])
+                    if parsed is None:
+                        self.console.print("Limit must be a positive integer.")
+                        return
+                    limit = parsed
+                    index += 2
+                    continue
+                self.console.print(f"Unknown /memory daily search option: {args[index]}")
+                return
+
+            results = self.daily_memory.search(query=query, day=day, limit=limit)
+            if not results:
+                self.console.print("No daily memory results found.")
+                return
+            self.console.print("Daily Memory Search Results")
+            for result in results:
+                snippet = result.content[:180]
+                if len(result.content) > 180:
+                    snippet += "..."
+                keywords = ", ".join(result.keywords[:6]) if result.keywords else "-"
+                self.console.print(
+                    f"- {result.day} chunk={result.chunk_index} keywords={keywords} text={snippet}"
+                )
+            self.console.print()
+            return
+
+        self.console.print("Usage: /memory daily days [limit] | /memory daily search <query> [--day YYYY-MM-DD] [--limit N]")
 
     async def _handle_graph_command(self, args: Sequence[str]) -> None:
         if not args or args[0].lower() == "help":
@@ -948,6 +1035,37 @@ class AssistantCLI:
         if value <= 0:
             return None
         return value
+
+    def _append_daily_memory_exchange(self, *, message: HumanMessage, assistant_text: str) -> None:
+        try:
+            user_text = self._human_message_to_text(message)
+            self.daily_memory.append_exchange(
+                user_text=user_text,
+                assistant_text=assistant_text,
+            )
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Failed to append daily memory exchange", exc_info=True)
+
+    def _human_message_to_text(self, message: HumanMessage) -> str:
+        content = message.content
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                    continue
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        text = item.get("text")
+                        if isinstance(text, str):
+                            parts.append(text)
+                    elif item.get("type") == "image_url":
+                        parts.append("[image]")
+            joined = "\n".join(part for part in parts if part)
+            return joined or "(non-text input)"
+        return str(content)
 
     def _handle_skills_command(self, args: Sequence[str]) -> None:
         if not args or args[0].lower() == "list":
@@ -1287,6 +1405,8 @@ class AssistantCLI:
             ("/approval global on|off", "Toggle global approval"),
             ("/approval tool <tool> on|off", "Toggle approval for one tool"),
             ("/memory", "Show short-term memory stats"),
+            ("/memory daily days [limit]", "List archived daily memory files"),
+            ("/memory daily search <query> [--day YYYY-MM-DD] [--limit N]", "Search daily memory chunks"),
             ("/graph", "Manage and execute automation graphs"),
             ("/skills", "List available skills"),
             ("/skills refresh", "Rescan skill directories"),
@@ -1332,6 +1452,8 @@ class AssistantCLI:
             return ["refresh", "on <server>", "off <server>"]
         if root_command == "/approval":
             return ["global on", "global off", "tool <tool_name> on", "tool <tool_name> off"]
+        if root_command == "/memory":
+            return ["daily days [limit]", "daily search <query> --day YYYY-MM-DD --limit N"]
         if root_command == "/paths":
             return ["list", "add <path>", "add downloads", "add desktop", "add documents", "remove <path>"]
         if root_command == "/llm":
@@ -1409,6 +1531,10 @@ class AssistantCLI:
 
         if result.stop_reason == "tool_rejected":
             streamer.finish()
+            self._append_daily_memory_exchange(
+                message=message,
+                assistant_text=(result.final_answer or "Tool execution was rejected."),
+            )
             return
 
         streamer.finish()
@@ -1420,6 +1546,8 @@ class AssistantCLI:
                 self._print_plain_response(final_answer)
         elif not streamer.saw_token:
             self._print_plain_response(result.final_answer or "")
+
+        self._append_daily_memory_exchange(message=message, assistant_text=(result.final_answer or ""))
 
     def _parse_on_off(self, value: str) -> bool | None:
         normalized = value.lower()

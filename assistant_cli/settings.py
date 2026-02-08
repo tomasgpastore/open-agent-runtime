@@ -37,6 +37,7 @@ class AppSettings:
     tool_timeout_seconds: int = 45
     mcp_connect_timeout_seconds: float = 12.0
     sqlite_path: Path = Path("data/assistant.db")
+    daily_memory_dir: Path = Path("data/memory/daily")
     runtime_state_path: Path = Path("data/runtime_state.json")
     mcp_config_path: Path = Path("config/mcp_servers.json")
     mcp_fallback_config_path: Path = Path("config/mcp_servers.sample.json")
@@ -91,6 +92,9 @@ def load_settings() -> AppSettings:
     load_dotenv()
 
     sqlite_path = Path(os.getenv("ASSISTANT_SQLITE_PATH", "data/assistant.db")).expanduser()
+    daily_memory_dir = Path(
+        os.getenv("ANTON_DAILY_MEMORY_DIR", "data/memory/daily")
+    ).expanduser()
     runtime_state_path = Path(
         os.getenv("ASSISTANT_RUNTIME_STATE_PATH", "data/runtime_state.json")
     ).expanduser()
@@ -117,6 +121,7 @@ def load_settings() -> AppSettings:
         tool_timeout_seconds=_get_int("TOOL_TIMEOUT_SECONDS", 45),
         mcp_connect_timeout_seconds=_get_float("MCP_CONNECT_TIMEOUT_SECONDS", 12.0),
         sqlite_path=sqlite_path,
+        daily_memory_dir=daily_memory_dir,
         runtime_state_path=runtime_state_path,
         mcp_config_path=mcp_config_path,
         skill_dirs=skill_dirs,
@@ -125,5 +130,6 @@ def load_settings() -> AppSettings:
     )
 
     settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.daily_memory_dir.mkdir(parents=True, exist_ok=True)
     settings.runtime_state_path.parent.mkdir(parents=True, exist_ok=True)
     return settings
