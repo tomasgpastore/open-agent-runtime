@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.tools import BaseTool
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import ANSI
@@ -29,14 +30,19 @@ from rich.markdown import Markdown
 from assistant_cli.agent_graph import LangGraphAgent
 from assistant_cli.approval import ApprovalManager
 from assistant_cli.daily_memory import DailyMemoryArchive
+from assistant_cli.graph.builder import GraphBuilderAnton
 from assistant_cli.graph import (
+    ErrorHandlerAnton,
+    GraphHookRegistry,
     GraphExecutionError,
     GraphExecutor,
     GraphStateStore,
     GraphValidationError,
     validate_graph_or_raise,
 )
+from assistant_cli.graph.scheduler import GraphScheduler
 from assistant_cli.llm_client import (
+    LLMClient,
     OpenAILLMClient,
     OpenAILLMConfig,
     OpenAIModelListError,
@@ -48,6 +54,8 @@ from assistant_cli.logging_utils import configure_logging
 from assistant_cli.mcp_manager import MCPManager
 from assistant_cli.memory_store import SQLiteMemoryStore
 from assistant_cli.memory_tools import wipe_memory_graph
+from assistant_cli.long_term_memory import LongTermMemoryStore, MemoryRetrievalPlanner
+from assistant_cli.cloud.local_backend import LocalExecutionBackend
 from assistant_cli.settings import load_settings
 from assistant_cli.skills_manager import SkillManager
 
@@ -232,8 +240,12 @@ class AssistantCLI:
             root_dir=self.settings.daily_memory_dir,
             db_path=self.settings.sqlite_path,
         )
+        self.long_term_memory = LongTermMemoryStore(db_path=self.settings.sqlite_path)
+        self.memory_retrieval = MemoryRetrievalPlanner(
+            daily_archive=self.daily_memory,
+            long_term_store=self.long_term_memory,
+        )
         self.graph_state_store = GraphStateStore(db_path=self.settings.sqlite_path)
-        self.graph_executor = GraphExecutor(state_store=self.graph_state_store)
 
         self.approval_manager = ApprovalManager()
         self.mcp_manager = MCPManager(
@@ -251,6 +263,23 @@ class AssistantCLI:
         if persisted_selection is not None:
             self.current_provider, self.current_model = persisted_selection
         llm_client = self._build_initial_llm_client()
+
+        self.graph_hooks = GraphHookRegistry()
+        self.error_handler_anton = ErrorHandlerAnton()
+        self.graph_executor = GraphExecutor(
+            state_store=self.graph_state_store,
+            llm_client=llm_client,
+            hook_registry=self.graph_hooks,
+            error_handler=self.error_handler_anton,
+            tool_timeout_seconds=float(self.settings.tool_timeout_seconds),
+        )
+        self.graph_builder = GraphBuilderAnton(llm_client=llm_client)
+        self.execution_backend = LocalExecutionBackend(executor=self.graph_executor)
+        self.scheduler = GraphScheduler(
+            state_store=self.graph_state_store,
+            execute_callback=self._execute_scheduled_graph,
+        )
+        self._scheduler_task: asyncio.Task[None] | None = None
 
         self.agent = LangGraphAgent(
             db_path=self.settings.sqlite_path,
@@ -476,6 +505,8 @@ class AssistantCLI:
             raise ValueError(f"Unsupported provider: {provider}")
 
         self.agent.set_llm_client(client)
+        self.graph_executor.set_llm_client(client)
+        self.graph_builder = GraphBuilderAnton(llm_client=client)
         self.current_provider = provider
         self.current_model = model
         self._save_runtime_llm_selection()
@@ -686,8 +717,65 @@ class AssistantCLI:
             self._handle_daily_memory_command(args[1:])
             return
 
+        if args and args[0].lower() == "fact":
+            self._handle_long_term_memory_command(args[1:])
+            return
+
+        if args and args[0].lower() == "retrieve":
+            if len(args) < 2:
+                self.console.print("Usage: /memory retrieve <query> [--day YYYY-MM-DD] [--limit N]")
+                return
+            index = 1
+            query_parts: list[str] = []
+            while index < len(args) and not args[index].startswith("--"):
+                query_parts.append(args[index])
+                index += 1
+            query = " ".join(query_parts).strip()
+            if not query:
+                self.console.print("Query is required.")
+                return
+            day: str | None = None
+            limit = 8
+            while index < len(args):
+                token = args[index].lower()
+                if token == "--day":
+                    if index + 1 >= len(args):
+                        self.console.print("Missing value for --day")
+                        return
+                    day = args[index + 1]
+                    index += 2
+                    continue
+                if token == "--limit":
+                    if index + 1 >= len(args):
+                        self.console.print("Missing value for --limit")
+                        return
+                    parsed = self._parse_positive_int(args[index + 1])
+                    if parsed is None:
+                        self.console.print("Limit must be a positive integer.")
+                        return
+                    limit = parsed
+                    index += 2
+                    continue
+                self.console.print(f"Unknown /memory retrieve option: {args[index]}")
+                return
+            items = self.memory_retrieval.retrieve(query=query, day=day, limit=limit)
+            if not items:
+                self.console.print("No memory results found.")
+                return
+            self.console.print("Combined Memory Retrieval")
+            for item in items:
+                meta = json.dumps(item.metadata, ensure_ascii=False)
+                snippet = item.content[:180]
+                if len(item.content) > 180:
+                    snippet += "..."
+                self.console.print(
+                    f"- source={item.source} score={item.score:.2f} meta={meta} text={snippet}"
+                )
+            self.console.print()
+            return
+
         if args:
-            self.console.print("Usage: /memory | /memory daily ...")
+            self.console.print("Usage: /memory | /memory daily ... | /memory fact ... | /memory retrieve ...")
             return
 
         stats = self.memory_store.stats()
@@ -702,6 +790,161 @@ class AssistantCLI:
         for line in body.splitlines():
             self.console.print(f"- {line}")
         self.console.print()
+
+    def _handle_long_term_memory_command(self, args: Sequence[str]) -> None:
+        if not args:
+            self.console.print(
+                "Usage: /memory fact <add|search|get|delete|list|prune> ..."
+            )
+            return
+
+        action = args[0].lower()
+        if action == "add":
+            if len(args) < 3:
+                self.console.print("Usage: /memory fact add <namespace> <content> [--importance 1-5] [--ttl-days N]")
+                return
+            namespace = args[1]
+            index = 2
+            content_parts: list[str] = []
+            while index < len(args) and not args[index].startswith("--"):
+                content_parts.append(args[index])
+                index += 1
+            content = " ".join(content_parts).strip()
+            if not content:
+                self.console.print("Content is required.")
+                return
+            importance = 3
+            ttl_days: int | None = None
+            while index < len(args):
+                token = args[index].lower()
+                if token == "--importance":
+                    if index + 1 >= len(args):
+                        self.console.print("Missing value for --importance")
+                        return
+                    parsed = self._parse_positive_int(args[index + 1])
+                    if parsed is None:
+                        self.console.print("Importance must be a positive integer.")
+                        return
+                    importance = max(1, min(5, parsed))
+                    index += 2
+                    continue
+                if token == "--ttl-days":
+                    if index + 1 >= len(args):
+                        self.console.print("Missing value for --ttl-days")
+                        return
+                    parsed = self._parse_positive_int(args[index + 1])
+                    if parsed is None:
+                        self.console.print("TTL days must be a positive integer.")
+                        return
+                    ttl_days = parsed
+                    index += 2
+                    continue
+                self.console.print(f"Unknown /memory fact add option: {args[index]}")
+                return
+
+            fact_id = self.long_term_memory.add_fact(
+                namespace=namespace,
+                content=content,
+                importance=importance,
+                ttl_days=ttl_days,
+            )
+            self.console.print(f"Stored long-term fact '{fact_id}'.")
+            return
+
+        if action == "search":
+            if len(args) < 2:
+                self.console.print("Usage: /memory fact search <query> [--namespace ns] [--limit N]")
+                return
+            index = 1
+            query_parts: list[str] = []
+            while index < len(args) and not args[index].startswith("--"):
+                query_parts.append(args[index])
+                index += 1
+            query = " ".join(query_parts).strip()
+            if not query:
+                self.console.print("Query is required.")
+                return
+            namespace: str | None = None
+            limit = 10
+            while index < len(args):
+                token = args[index].lower()
+                if token == "--namespace":
+                    if index + 1 >= len(args):
+                        self.console.print("Missing value for --namespace")
+                        return
+                    namespace = args[index + 1]
+                    index += 2
+                    continue
+                if token == "--limit":
+                    if index + 1 >= len(args):
+                        self.console.print("Missing value for --limit")
+                        return
+                    parsed = self._parse_positive_int(args[index + 1])
+                    if parsed is None:
+                        self.console.print("Limit must be a positive integer.")
+                        return
+                    limit = parsed
+                    index += 2
+                    continue
+                self.console.print(f"Unknown /memory fact search option: {args[index]}")
+                return
+            facts = self.long_term_memory.search(query=query, namespace=namespace, limit=limit)
+            if not facts:
+                self.console.print("No long-term facts found.")
+                return
+            self.console.print("Long-term Facts")
+            for fact in facts:
+                self.console.print(
+                    f"- {fact.fact_id}: ns={fact.namespace} importance={fact.importance} "
+                    f"ttl={fact.ttl_days if fact.ttl_days is not None else '-'} "
+                    f"updated={fact.updated_at} text={fact.content}"
+                )
+            self.console.print()
+            return
+
+        if action == "get":
+            if len(args) < 2:
+                self.console.print("Usage: /memory fact get <fact_id>")
+                return
+            fact = self.long_term_memory.get_fact(args[1])
+            if fact is None:
+                self.console.print(f"Fact '{args[1]}' not found.")
+                return
+            self.console.print(json.dumps(fact.__dict__, ensure_ascii=False, indent=2))
+            return
+
+        if action == "delete":
+            if len(args) < 2:
+                self.console.print("Usage: /memory fact delete <fact_id>")
+                return
+            removed = self.long_term_memory.delete_fact(args[1])
+            if removed:
+                self.console.print(f"Deleted fact '{args[1]}'.")
+            else:
+                self.console.print(f"Fact '{args[1]}' not found.")
+            return
+
+        if action == "list":
+            namespace = args[1] if len(args) >= 2 else None
+            facts = self.long_term_memory.list_facts(namespace=namespace, limit=50)
+            if not facts:
+                self.console.print("No long-term facts stored.")
+                return
+            self.console.print("Long-term Facts")
+            for fact in facts:
+                self.console.print(
+                    f"- {fact.fact_id}: ns={fact.namespace} importance={fact.importance} "
+                    f"updated={fact.updated_at} text={fact.content}"
+                )
+            self.console.print()
+            return
+
+        if action == "prune":
+            removed = self.long_term_memory.prune_expired()
+            self.console.print(f"Pruned {removed} expired long-term facts.")
+            return
+
+        self.console.print("Usage: /memory fact <add|search|get|delete|list|prune> ...")
 
     def _handle_daily_memory_command(self, args: Sequence[str]) -> None:
         if not args:
@@ -802,6 +1045,34 @@ class AssistantCLI:
             self.console.print(f"Saved graph '{graph['id']}' from {graph_path}.")
             return
 
+        if action == "build":
+            if len(args) < 2:
+                self.console.print("Usage: /graph build <intent text>")
+                return
+            intent = " ".join(args[1:]).strip()
+            if not intent:
+                self.console.print("Intent text is required.")
+                return
+            try:
+                built = await self.graph_builder.build_from_intent(
+                    intent=intent,
+                    available_tools=sorted(self._active_tool_map().keys()),
+                )
+                validate_graph_or_raise(built.graph)
+                self.graph_state_store.save_graph_definition(built.graph)
+            except (GraphValidationError, GraphExecutionError, ValueError) as exc:
+                self.console.print(f"Failed to build graph: {exc}")
+                return
+            self.console.print(
+                f"Built graph '{built.graph['id']}' (source={built.source}, attempts={built.attempts})."
+            )
+            if built.warnings:
+                self.console.print("Warnings:")
+                for warning in built.warnings:
+                    self.console.print(f"- {warning}")
+            self.console.print(json.dumps(built.graph, ensure_ascii=False, indent=2))
+            return
+
         if action == "validate":
             if len(args) < 2:
                 self.console.print("Usage: /graph validate <path.json|graph_id>")
@@ -826,6 +1097,46 @@ class AssistantCLI:
                 return
             rendered = json.dumps(graph, ensure_ascii=False, indent=2)
             self.console.print(rendered)
+            return
+
+        if action == "render":
+            if len(args) < 2:
+                self.console.print("Usage: /graph render <path.json|graph_id>")
+                return
+            try:
+                graph, _ = self._load_graph_reference(args[1])
+                validate_graph_or_raise(graph)
+            except (OSError, json.JSONDecodeError, GraphValidationError, ValueError) as exc:
+                self.console.print(f"Failed to render graph: {exc}")
+                return
+            self._render_graph_ascii(graph)
+            return
+
+        if action == "patch":
+            if len(args) < 5:
+                self.console.print("Usage: /graph patch <graph_id> <node_id> <field> <json_value>")
+                return
+            graph_id = args[1]
+            node_id = args[2]
+            field = args[3]
+            raw_value = " ".join(args[4:])
+            try:
+                graph = self.graph_state_store.get_graph_definition(graph_id)
+                if graph is None:
+                    raise ValueError(f"Graph '{graph_id}' was not found.")
+                value = json.loads(raw_value)
+                patched = self.graph_builder.patch_node_field(
+                    graph=graph,
+                    node_id=node_id,
+                    field=field,
+                    value=value,
+                )
+                validate_graph_or_raise(patched)
+                self.graph_state_store.save_graph_definition(patched)
+            except (ValueError, json.JSONDecodeError, GraphValidationError) as exc:
+                self.console.print(f"Graph patch failed: {exc}")
+                return
+            self.console.print(f"Patched graph '{graph_id}' node '{node_id}' field '{field}'.")
             return
 
         if action == "run":
@@ -867,10 +1178,12 @@ class AssistantCLI:
                 graph, _ = self._load_graph_reference(graph_ref)
                 validate_graph_or_raise(graph)
                 self.graph_state_store.save_graph_definition(graph)
-                result = self.graph_executor.run(
+                self._active_tool_map()
+                result = await self.execution_backend.run_graph(
                     graph=graph,
                     input_payload=input_payload,
                     guarantee_mode=mode,
+                    trigger_source="manual:/graph run",
                 )
             except (
                 OSError,
@@ -882,14 +1195,35 @@ class AssistantCLI:
                 self.console.print(f"Graph run failed: {exc}")
                 return
 
-            self.console.print("Graph Run")
-            self.console.print(f"- run_id: {result.run_id}")
-            self.console.print(f"- graph_id: {result.graph_id}")
-            self.console.print(f"- mode: {result.guarantee_mode}")
-            self.console.print(f"- status: {result.status}")
-            self.console.print(f"- visited_nodes: {', '.join(result.visited_nodes)}")
-            self.console.print(f"- output: {json.dumps(result.output, ensure_ascii=False)}")
-            self.console.print()
+            self._print_graph_run_result(result)
+            return
+
+        if action == "replay":
+            if len(args) < 2:
+                self.console.print("Usage: /graph replay <run_id>")
+                return
+            run_id = args[1]
+            try:
+                self.execution_backend.set_tool_map(self._active_tool_map())
+                result = await self.execution_backend.replay_run(run_id=run_id)
+            except Exception as exc:  # noqa: BLE001
+                self.console.print(f"Replay failed: {exc}")
+                return
+            self._print_graph_run_result(result)
+            return
+
+        if action == "resume":
+            if len(args) < 2:
+                self.console.print("Usage: /graph resume <run_id>")
+                return
+            run_id = args[1]
+            try:
+                self.execution_backend.set_tool_map(self._active_tool_map())
+                result = await self.execution_backend.resume_run(run_id=run_id)
+            except Exception as exc:  # noqa: BLE001
+                self.console.print(f"Resume failed: {exc}")
+                return
+            self._print_graph_run_result(result)
             return
 
         if action == "runs":
@@ -913,7 +1247,8 @@ class AssistantCLI:
             for run in runs:
                 self.console.print(
                     f"- {run.run_id}: status={run.status}, mode={run.guarantee_mode}, "
-                    f"started={run.started_at}, finished={run.finished_at or '-'}"
+                    f"started={run.started_at}, finished={run.finished_at or '-'}, "
+                    f"parent={run.parent_run_id or '-'}, resumed_from={run.resume_from_run_id or '-'}"
                 )
             self.console.print()
             return
@@ -922,13 +1257,17 @@ class AssistantCLI:
             await self._handle_graph_state_command(args[1:])
             return
 
+        if action == "schedule":
+            await self._handle_graph_schedule_command(args[1:])
+            return
+
         self.console.print(
-            "Usage: /graph <help|list|save|validate|show|run|runs|state ...>. Use /graph help for details."
+            "Usage: /graph <help|list|save|build|validate|show|render|patch|run|replay|resume|runs|state|schedule ...>."
         )
 
     async def _handle_graph_state_command(self, args: Sequence[str]) -> None:
         if not args:
-            self.console.print("Usage: /graph state <show|get|history> ...")
+            self.console.print("Usage: /graph state <show|get|history|checkpoints> ...")
             return
 
         action = args[0].lower()
@@ -986,19 +1325,200 @@ class AssistantCLI:
             self.console.print()
             return
 
-        self.console.print("Usage: /graph state <show|get|history> ...")
+        if action == "checkpoints":
+            if len(args) < 2:
+                self.console.print("Usage: /graph state checkpoints <run_id> [limit]")
+                return
+            run_id = args[1]
+            limit = 200
+            if len(args) >= 3:
+                parsed = self._parse_positive_int(args[2])
+                if parsed is None:
+                    self.console.print("Limit must be a positive integer.")
+                    return
+                limit = parsed
+            checkpoints = self.graph_state_store.list_checkpoints(run_id=run_id, limit=limit)
+            if not checkpoints:
+                self.console.print(f"No checkpoints found for run '{run_id}'.")
+                return
+            self.console.print(f"Checkpoints for run '{run_id}'")
+            for cp in checkpoints:
+                self.console.print(
+                    f"- id={cp.id} node={cp.node_id} status={cp.status} step={cp.step} "
+                    f"retry={cp.retry_count} next={cp.next_node_id or '-'} at={cp.created_at}"
+                )
+            self.console.print()
+            return
+
+        self.console.print("Usage: /graph state <show|get|history|checkpoints> ...")
+
+    async def _handle_graph_schedule_command(self, args: Sequence[str]) -> None:
+        if not args:
+            self.console.print(
+                "Usage: /graph schedule <add|list|on|off|delete|trigger|tick|start|stop> ..."
+            )
+            return
+
+        action = args[0].lower()
+        if action == "add":
+            if len(args) < 4:
+                self.console.print(
+                    "Usage: /graph schedule add <graph_id> <cron_expr_in_quotes> [--mode strict|bounded|flex] [--input path.json]"
+                )
+                return
+            graph_id = args[1]
+            cron_expr = args[2]
+            mode = "bounded"
+            input_payload: object = {}
+
+            index = 3
+            while index < len(args):
+                flag = args[index].lower()
+                if flag == "--mode":
+                    if index + 1 >= len(args):
+                        self.console.print("Missing value for --mode")
+                        return
+                    mode = args[index + 1].lower()
+                    index += 2
+                    continue
+                if flag == "--input":
+                    if index + 1 >= len(args):
+                        self.console.print("Missing value for --input")
+                        return
+                    input_path = Path(args[index + 1]).expanduser()
+                    try:
+                        input_payload = json.loads(input_path.read_text(encoding="utf-8"))
+                    except Exception as exc:  # noqa: BLE001
+                        self.console.print(f"Failed to load input payload: {exc}")
+                        return
+                    index += 2
+                    continue
+                self.console.print(f"Unknown /graph schedule add option: {args[index]}")
+                return
+
+            if self.graph_state_store.get_graph_definition(graph_id) is None:
+                self.console.print(f"Graph '{graph_id}' is not saved. Save/build it first.")
+                return
+            try:
+                schedule_id = self.scheduler.add_schedule(
+                    graph_id=graph_id,
+                    cron_expr=cron_expr,
+                    guarantee_mode=mode,
+                    input_payload=input_payload,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.console.print(f"Failed to add schedule: {exc}")
+                return
+            self.console.print(f"Created schedule '{schedule_id}' for graph '{graph_id}'.")
+            return
+
+        if action == "list":
+            schedules = self.scheduler.list_schedules(enabled_only=False, limit=200)
+            if not schedules:
+                self.console.print("No graph schedules configured.")
+                return
+            self.console.print("Graph Schedules")
+            for item in schedules:
+                self.console.print(
+                    f"- {item.schedule_id}: graph={item.graph_id} enabled={'yes' if item.enabled else 'no'} "
+                    f"cron='{item.cron_expr}' mode={item.guarantee_mode} next={item.next_run_at} "
+                    f"last_run={item.last_run_at or '-'} last_error={item.last_error or '-'}"
+                )
+            self.console.print()
+            return
+
+        if action in {"on", "off"}:
+            if len(args) < 2:
+                self.console.print("Usage: /graph schedule on|off <schedule_id>")
+                return
+            schedule_id = args[1]
+            self.scheduler.set_enabled(schedule_id=schedule_id, enabled=(action == "on"))
+            self.console.print(f"Schedule '{schedule_id}' {'enabled' if action == 'on' else 'disabled'}.")
+            return
+
+        if action == "delete":
+            if len(args) < 2:
+                self.console.print("Usage: /graph schedule delete <schedule_id>")
+                return
+            self.scheduler.delete(args[1])
+            self.console.print(f"Deleted schedule '{args[1]}'.")
+            return
+
+        if action == "trigger":
+            if len(args) < 2:
+                self.console.print("Usage: /graph schedule trigger <schedule_id>")
+                return
+            try:
+                result = await self.scheduler.trigger(args[1])
+            except Exception as exc:  # noqa: BLE001
+                self.console.print(f"Failed to trigger schedule: {exc}")
+                return
+            self.console.print(
+                f"Schedule trigger result: {result.schedule_id} graph={result.graph_id} status={result.status} detail={result.detail}"
+            )
+            return
+
+        if action == "tick":
+            results = await self.scheduler.trigger_due()
+            if not results:
+                self.console.print("No schedules were due.")
+                return
+            self.console.print("Scheduler tick results")
+            for item in results:
+                self.console.print(
+                    f"- {item.schedule_id}: graph={item.graph_id} status={item.status} detail={item.detail}"
+                )
+            self.console.print()
+            return
+
+        if action == "start":
+            if self._scheduler_task is not None and not self._scheduler_task.done():
+                self.console.print("Scheduler loop is already running.")
+                return
+            self._scheduler_task = asyncio.create_task(self._scheduler_loop())
+            self.console.print("Scheduler loop started.")
+            return
+
+        if action == "stop":
+            task = self._scheduler_task
+            if task is None or task.done():
+                self.console.print("Scheduler loop is not running.")
+                self._scheduler_task = None
+                return
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+            self._scheduler_task = None
+            self.console.print("Scheduler loop stopped.")
+            return
+
+        self.console.print(
+            "Usage: /graph schedule <add|list|on|off|delete|trigger|tick|start|stop> ..."
+        )
 
     def _print_graph_help(self) -> None:
         self.console.print("Graph Commands")
         self.console.print("- /graph list")
         self.console.print("- /graph save <path.json>")
+        self.console.print("- /graph build <intent text>")
         self.console.print("- /graph validate <path.json|graph_id>")
         self.console.print("- /graph show <path.json|graph_id>")
+        self.console.print("- /graph render <path.json|graph_id>")
+        self.console.print("- /graph patch <graph_id> <node_id> <field> <json_value>")
         self.console.print("- /graph run <path.json|graph_id> [--mode strict|bounded|flex] [--input path.json]")
+        self.console.print("- /graph replay <run_id>")
+        self.console.print("- /graph resume <run_id>")
         self.console.print("- /graph runs <graph_id> [limit]")
         self.console.print("- /graph state show <graph_id>")
         self.console.print("- /graph state get <graph_id> <key>")
         self.console.print("- /graph state history <graph_id> [limit]")
+        self.console.print("- /graph state checkpoints <run_id> [limit]")
+        self.console.print("- /graph schedule add <graph_id> '<cron_expr>' [--mode strict|bounded|flex] [--input path.json]")
+        self.console.print("- /graph schedule list")
+        self.console.print("- /graph schedule on|off <schedule_id>")
+        self.console.print("- /graph schedule trigger <schedule_id>")
+        self.console.print("- /graph schedule tick")
+        self.console.print("- /graph schedule start|stop")
         self.console.print()
 
     def _print_graph_list(self) -> None:
@@ -1010,6 +1530,93 @@ class AssistantCLI:
         for item in graphs:
             self.console.print(f"- {item['graph_id']}: {item['name']} (updated: {item['updated_at']})")
         self.console.print()
+
+    def _print_graph_run_result(self, result: object) -> None:
+        run_id = getattr(result, "run_id", None)
+        graph_id = getattr(result, "graph_id", None)
+        mode = getattr(result, "guarantee_mode", None)
+        status = getattr(result, "status", None)
+        output = getattr(result, "output", None)
+        visited = getattr(result, "visited_nodes", None)
+
+        self.console.print("Graph Run")
+        if run_id is not None:
+            self.console.print(f"- run_id: {run_id}")
+        if graph_id is not None:
+            self.console.print(f"- graph_id: {graph_id}")
+        if mode is not None:
+            self.console.print(f"- mode: {mode}")
+        if status is not None:
+            self.console.print(f"- status: {status}")
+        if isinstance(visited, list):
+            self.console.print(f"- visited_nodes: {', '.join(str(item) for item in visited)}")
+        try:
+            rendered_output = json.dumps(output, ensure_ascii=False)
+        except TypeError:
+            rendered_output = str(output)
+        self.console.print(f"- output: {rendered_output}")
+        self.console.print()
+
+    def _render_graph_ascii(self, graph: dict[str, object]) -> None:
+        nodes_raw = graph.get("nodes")
+        if not isinstance(nodes_raw, list):
+            self.console.print("Graph has no nodes.")
+            return
+        node_map: dict[str, dict[str, object]] = {}
+        for node in nodes_raw:
+            if not isinstance(node, dict):
+                continue
+            node_id = node.get("node_id")
+            if isinstance(node_id, str):
+                node_map[node_id] = node
+
+        self.console.print(f"Graph: {graph.get('id')} ({graph.get('name')})")
+        self.console.print(f"Start: {graph.get('start')}")
+        for node_id, node in node_map.items():
+            node_type = node.get("type")
+            if node_type == "condition":
+                edges = [
+                    f"if_true->{node.get('if_true')}",
+                    f"if_false->{node.get('if_false')}",
+                ]
+            else:
+                next_field = node.get("next")
+                if isinstance(next_field, list):
+                    edges = [f"next->{item}" for item in next_field]
+                elif isinstance(next_field, str):
+                    edges = [f"next->{next_field}"]
+                else:
+                    edges = []
+            edge_text = ", ".join(edges) if edges else "(terminal)"
+            self.console.print(f"- {node_id} [{node_type}] {edge_text}")
+        self.console.print()
+
+    async def _execute_scheduled_graph(
+        self,
+        graph_id: str,
+        guarantee_mode: str,
+        input_payload: object,
+        schedule_id: str,
+    ) -> object:
+        graph = self.graph_state_store.get_graph_definition(graph_id)
+        if graph is None:
+            raise ValueError(f"Scheduled graph '{graph_id}' was not found.")
+        validate_graph_or_raise(graph)
+        self.execution_backend.set_tool_map(self._active_tool_map())
+        return await self.execution_backend.run_graph(
+            graph=graph,
+            input_payload=input_payload,
+            guarantee_mode=guarantee_mode,
+            trigger_source=f"schedule:{schedule_id}",
+        )
+
+    async def _scheduler_loop(self) -> None:
+        while True:
+            try:
+                await self.scheduler.trigger_due()
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error("Scheduler loop tick failed: %s", exc)
+            await asyncio.sleep(30)
 
     def _load_graph_reference(self, graph_ref: str) -> tuple[dict[str, object], str]:
         path = Path(graph_ref).expanduser()
@@ -1026,6 +1633,13 @@ class AssistantCLI:
         if not isinstance(payload, dict):
             raise ValueError("Graph file must contain a JSON object.")
         return payload
+
+    def _active_tool_map(self) -> dict[str, BaseTool]:
+        tool_map = {tool.name: tool for tool in self.mcp_manager.active_tools()}
+        backend = getattr(self, "execution_backend", None)
+        if backend is not None:
+            backend.set_tool_map(tool_map)
+        return tool_map
 
     def _parse_positive_int(self, raw: str) -> int | None:
         try:
@@ -1297,10 +1911,13 @@ class AssistantCLI:
             self.console.print("Kept long-term memory.")
             return
 
-        tools = {tool.name: tool for tool in self.mcp_manager.active_tools()}
+        removed_local = self.long_term_memory.clear_all()
+        self.console.print(f"Cleared {removed_local} local long-term facts.")
+
+        tools = self._active_tool_map()
         if not tools:
             self.console.print(
-                "No MCP tools are currently active. Run /mcp refresh and retry /new if needed."
+                "No MCP tools are currently active. Skipped MCP memory wipe."
             )
             return
         try:
@@ -1320,7 +1937,7 @@ class AssistantCLI:
         provider = self.current_provider
         cwd = str(Path.cwd())
         lines = [
-            "Anton v0.1",
+            "Anton v0.2",
             f"Model: {model} ({provider})",
             f"Dir: {cwd}",
         ]
@@ -1407,6 +2024,8 @@ class AssistantCLI:
             ("/memory", "Show short-term memory stats"),
             ("/memory daily days [limit]", "List archived daily memory files"),
             ("/memory daily search <query> [--day YYYY-MM-DD] [--limit N]", "Search daily memory chunks"),
+            ("/memory fact ...", "Manage long-term facts (add/search/get/delete/list/prune)"),
+            ("/memory retrieve <query>", "Retrieve combined daily + long-term memory"),
             ("/graph", "Manage and execute automation graphs"),
             ("/skills", "List available skills"),
             ("/skills refresh", "Rescan skill directories"),
@@ -1453,7 +2072,17 @@ class AssistantCLI:
         if root_command == "/approval":
             return ["global on", "global off", "tool <tool_name> on", "tool <tool_name> off"]
         if root_command == "/memory":
-            return ["daily days [limit]", "daily search <query> --day YYYY-MM-DD --limit N"]
+            return [
+                "daily days [limit]",
+                "daily search <query> --day YYYY-MM-DD --limit N",
+                "fact add <namespace> <content> --importance 1-5 --ttl-days N",
+                "fact search <query> --namespace <ns> --limit N",
+                "fact get <fact_id>",
+                "fact delete <fact_id>",
+                "fact list [namespace]",
+                "fact prune",
+                "retrieve <query> --day YYYY-MM-DD --limit N",
+            ]
         if root_command == "/paths":
             return ["list", "add <path>", "add downloads", "add desktop", "add documents", "remove <path>"]
         if root_command == "/llm":
@@ -1463,13 +2092,27 @@ class AssistantCLI:
                 "help",
                 "list",
                 "save <path.json>",
+                "build <intent text>",
                 "validate <path.json|graph_id>",
                 "show <path.json|graph_id>",
+                "render <path.json|graph_id>",
+                "patch <graph_id> <node_id> <field> <json_value>",
                 "run <path.json|graph_id> --mode strict|bounded|flex --input <path.json>",
+                "replay <run_id>",
+                "resume <run_id>",
                 "runs <graph_id> [limit]",
                 "state show <graph_id>",
                 "state get <graph_id> <key>",
                 "state history <graph_id> [limit]",
+                "state checkpoints <run_id> [limit]",
+                "schedule add <graph_id> '<cron_expr>' --mode strict|bounded|flex --input <path.json>",
+                "schedule list",
+                "schedule on <schedule_id>",
+                "schedule off <schedule_id>",
+                "schedule trigger <schedule_id>",
+                "schedule tick",
+                "schedule start",
+                "schedule stop",
             ]
         if root_command == "/skills":
             return ["list", "refresh", "show <name>", "paths"]
@@ -1496,7 +2139,7 @@ class AssistantCLI:
         initial_messages, pre_truncation = self.memory_store.enforce_token_limit([*history, message])
         streamer = ResponseStreamPrinter()
 
-        tool_map = {tool.name: tool for tool in self.mcp_manager.active_tools()}
+        tool_map = self._active_tool_map()
 
         try:
             result = await self.agent.run(
@@ -1597,6 +2240,12 @@ class AssistantCLI:
             self._startup_refresh_task = None
 
     async def aclose(self) -> None:
+        scheduler_task = self._scheduler_task
+        if scheduler_task is not None and not scheduler_task.done():
+            scheduler_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await scheduler_task
+            self._scheduler_task = None
         task = self._startup_refresh_task
         if task is not None and not task.done():
             task.cancel()
@@ -1609,6 +2258,8 @@ class AssistantCLI:
     async def run(self) -> None:
         self._print_welcome()
         self._startup_refresh_task = asyncio.create_task(self._safe_refresh_mcp("startup"))
+        if self._scheduler_task is None or self._scheduler_task.done():
+            self._scheduler_task = asyncio.create_task(self._scheduler_loop())
 
         while True:
             self._clear_current_task_cancellation()
