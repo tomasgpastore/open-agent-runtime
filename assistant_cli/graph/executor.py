@@ -1,18 +1,28 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Mapping
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
 
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import BaseTool
+
+from assistant_cli.graph.error_handler import ErrorHandlerAnton
+from assistant_cli.graph.hooks import GraphHookRegistry
 from assistant_cli.graph.schema import (
     ALLOWED_GUARANTEE_MODES,
     GraphValidationError,
     validate_graph_or_raise,
 )
 from assistant_cli.graph.state_store import GraphStateStore
+from assistant_cli.llm_client import LLMClient
 
 
 TEMPLATE_VALUE_RE = re.compile(r"^\{\{([^{}]+)\}\}$")
+TEMPLATE_INLINE_RE = re.compile(r"\{\{([^{}]+)\}\}")
 
 
 class GraphExecutionError(RuntimeError):
@@ -30,16 +40,43 @@ class GraphExecutionResult:
 
 
 class GraphExecutor:
-    """Deterministic graph executor with explicit state nodes."""
+    """State-aware graph executor with hooks, retries, replay, and resume support."""
 
-    def __init__(self, state_store: GraphStateStore) -> None:
-        self._state_store = state_store
-
-    def run(
+    def __init__(
         self,
+        state_store: GraphStateStore,
+        *,
+        llm_client: LLMClient | None = None,
+        hook_registry: GraphHookRegistry | None = None,
+        error_handler: ErrorHandlerAnton | None = None,
+        tool_timeout_seconds: float = 45.0,
+    ) -> None:
+        self._state_store = state_store
+        self._llm_client = llm_client
+        self._hooks = hook_registry or GraphHookRegistry()
+        self._error_handler = error_handler or ErrorHandlerAnton()
+        self._tool_timeout_seconds = max(1.0, float(tool_timeout_seconds))
+
+    def set_llm_client(self, llm_client: LLMClient) -> None:
+        self._llm_client = llm_client
+
+    @property
+    def hooks(self) -> GraphHookRegistry:
+        return self._hooks
+
+    async def arun(
+        self,
+        *,
         graph: dict[str, Any],
         input_payload: object | None = None,
         guarantee_mode: str = "bounded",
+        tool_map: dict[str, BaseTool] | None = None,
+        llm_client: LLMClient | None = None,
+        start_node_id: str | None = None,
+        context_override: dict[str, object] | None = None,
+        parent_run_id: str | None = None,
+        resume_from_run_id: str | None = None,
+        metadata: dict[str, object] | None = None,
     ) -> GraphExecutionResult:
         if guarantee_mode not in ALLOWED_GUARANTEE_MODES:
             raise GraphExecutionError(
@@ -49,26 +86,47 @@ class GraphExecutor:
         validate_graph_or_raise(graph)
         self._validate_mode_policy(graph, guarantee_mode)
 
+        active_llm_client = llm_client or self._llm_client
+        active_tools = tool_map or {}
+
         graph_id = str(graph["id"])
         nodes = graph["nodes"]
         node_map = {str(node["node_id"]): node for node in nodes}
-        max_steps = int(graph.get("max_steps", max(20, len(nodes) * 10)))
+        max_steps = int(graph.get("max_steps", max(20, len(nodes) * 12)))
 
         run_id = self._state_store.start_run(
             graph_id=graph_id,
             guarantee_mode=guarantee_mode,
             input_payload=input_payload,
+            parent_run_id=parent_run_id,
+            resume_from_run_id=resume_from_run_id,
+            metadata=metadata,
         )
 
-        current_node_id = str(graph["start"])
-        context: dict[str, object] = {
-            "input": input_payload,
-            "run_id": run_id,
-            "graph_id": graph_id,
-        }
+        current_node_id = start_node_id or str(graph["start"])
+        context: dict[str, object] = dict(context_override or {})
+        context.update(
+            {
+                "input": input_payload,
+                "run_id": run_id,
+                "graph_id": graph_id,
+            }
+        )
+
         visited_nodes: list[str] = []
+        node_retries: dict[str, int] = {}
         steps = 0
         last_output: object = input_payload
+
+        await self._emit_hook(
+            "before_run",
+            {
+                "run_id": run_id,
+                "graph_id": graph_id,
+                "guarantee_mode": guarantee_mode,
+                "input": input_payload,
+            },
+        )
 
         try:
             while True:
@@ -84,25 +142,116 @@ class GraphExecutor:
 
                 node_type = str(node["type"])
                 node_input = self._resolve_value(node.get("input", last_output), context)
+
+                await self._emit_hook(
+                    "before_node",
+                    {
+                        "run_id": run_id,
+                        "graph_id": graph_id,
+                        "node_id": current_node_id,
+                        "node_type": node_type,
+                        "step": steps,
+                        "input": node_input,
+                    },
+                )
+
+                retry_count = node_retries.get(current_node_id, 0)
+                max_retries = int(node.get("max_retries", 0))
+                status = "ok"
                 output: object = None
                 next_node: str | None = None
 
-                if node_type == "start":
-                    output = node_input
-                    next_node = self._first_next(node)
-                elif node_type == "end":
-                    output = node_input
-                    self._state_store.add_checkpoint(
+                while True:
+                    try:
+                        output, next_node = await self._execute_node(
+                            node=node,
+                            node_input=node_input,
+                            context=context,
+                            guarantee_mode=guarantee_mode,
+                            tools=active_tools,
+                            llm_client=active_llm_client,
+                        )
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        decision = self._error_handler.decide(
+                            error=exc,
+                            node=node,
+                            guarantee_mode=guarantee_mode,
+                            retry_count=retry_count,
+                            max_retries=max_retries,
+                            context=context,
+                        )
+                        await self._emit_hook(
+                            "on_error",
+                            {
+                                "run_id": run_id,
+                                "graph_id": graph_id,
+                                "node_id": current_node_id,
+                                "step": steps,
+                                "error": str(exc),
+                                "decision": decision.action,
+                                "reason": decision.reason,
+                            },
+                        )
+
+                        if decision.action == "retry":
+                            retry_count += 1
+                            node_retries[current_node_id] = retry_count
+                            continue
+
+                        if decision.action == "fallback":
+                            status = "fallback"
+                            output = decision.fallback_output
+                            next_node = decision.fallback_next_node or self._first_next(node)
+                            break
+
+                        raise GraphExecutionError(
+                            f"Node '{current_node_id}' failed: {exc}. Error handler: {decision.reason}"
+                        ) from exc
+
+                if node_type != "end" and next_node is None:
+                    raise GraphExecutionError(f"Node '{current_node_id}' did not resolve a next node.")
+
+                context[current_node_id] = output
+                context["last"] = output
+                last_output = output
+
+                self._state_store.add_checkpoint(
+                    run_id=run_id,
+                    graph_id=graph_id,
+                    node_id=current_node_id,
+                    status=status,
+                    input_payload=node_input,
+                    output_payload=output,
+                    context_payload=context,
+                    next_node_id=next_node,
+                    step=steps,
+                    retry_count=retry_count,
+                )
+
+                await self._emit_hook(
+                    "after_node",
+                    {
+                        "run_id": run_id,
+                        "graph_id": graph_id,
+                        "node_id": current_node_id,
+                        "node_type": node_type,
+                        "step": steps,
+                        "status": status,
+                        "output": output,
+                        "next_node": next_node,
+                    },
+                )
+
+                visited_nodes.append(current_node_id)
+
+                if node_type == "end":
+                    self._state_store.finish_run(
                         run_id=run_id,
-                        graph_id=graph_id,
-                        node_id=current_node_id,
-                        status="ok",
-                        input_payload=node_input,
+                        status="succeeded",
                         output_payload=output,
                     )
-                    visited_nodes.append(current_node_id)
-                    self._state_store.finish_run(run_id=run_id, status="succeeded", output_payload=output)
-                    return GraphExecutionResult(
+                    result = GraphExecutionResult(
                         run_id=run_id,
                         graph_id=graph_id,
                         guarantee_mode=guarantee_mode,
@@ -110,103 +259,18 @@ class GraphExecutor:
                         output=output,
                         visited_nodes=visited_nodes,
                     )
-                elif node_type == "transform":
-                    output = self._resolve_value(node.get("value", node_input), context)
-                    next_node = self._first_next(node)
-                elif node_type == "read_state":
-                    key = str(node["key"])
-                    value = self._state_store.read_state(graph_id=graph_id, key=key)
-                    output = {"key": key, "value": value}
-                    next_node = self._first_next(node)
-                elif node_type == "write_state":
-                    key = str(node["key"])
-                    value_source = node.get("value", node_input)
-                    value = self._resolve_value(value_source, context)
-                    self._state_store.write_state(
-                        graph_id=graph_id,
-                        key=key,
-                        value=value,
-                        source_run_id=run_id,
-                        source_node_id=current_node_id,
+                    await self._emit_hook(
+                        "after_run",
+                        {
+                            "run_id": run_id,
+                            "graph_id": graph_id,
+                            "status": "succeeded",
+                            "output": output,
+                            "visited_nodes": visited_nodes,
+                        },
                     )
-                    output = {"key": key, "value": value, "written": True}
-                    next_node = self._first_next(node)
-                elif node_type == "read_prior_runs":
-                    limit = int(node.get("limit", 5))
-                    runs = self._state_store.read_prior_runs(graph_id=graph_id, limit=limit)
-                    output = {
-                        "count": len(runs),
-                        "runs": [
-                            {
-                                "run_id": run.run_id,
-                                "status": run.status,
-                                "guarantee_mode": run.guarantee_mode,
-                                "started_at": run.started_at,
-                                "finished_at": run.finished_at,
-                                "error_text": run.error_text,
-                            }
-                            for run in runs
-                            if run.run_id != run_id
-                        ],
-                    }
-                    next_node = self._first_next(node)
-                elif node_type == "condition":
-                    strategy = str(node.get("strategy"))
-                    if strategy == "typed_condition":
-                        result = self._evaluate_typed_condition(node=node, context=context)
-                        next_node = str(node["if_true"] if result else node["if_false"])
-                        output = {
-                            "strategy": strategy,
-                            "result": result,
-                            "next": next_node,
-                        }
-                    elif strategy == "llm_condition":
-                        decision = self._resolve_value(node.get("decision"), context)
-                        options = list(node.get("branch_options") or [])
-                        if not isinstance(decision, str) or decision not in options:
-                            if guarantee_mode == "strict":
-                                raise GraphExecutionError(
-                                    f"Strict mode requires llm_condition decision in allowed branch_options for node '{current_node_id}'."
-                                )
-                            decision = options[0]
-                        next_node = str(node["if_true"] if decision == options[0] else node["if_false"])
-                        output = {
-                            "strategy": strategy,
-                            "decision": decision,
-                            "next": next_node,
-                        }
-                    else:
-                        raise GraphExecutionError(
-                            f"Unsupported condition strategy '{strategy}' in node '{current_node_id}'."
-                        )
-                elif node_type in {"tool", "ai_template"}:
-                    if "mock_output" not in node:
-                        raise GraphExecutionError(
-                            f"Node '{current_node_id}' type '{node_type}' is not executable yet without 'mock_output'."
-                        )
-                    output = self._resolve_value(node.get("mock_output"), context)
-                    next_node = self._first_next(node)
-                else:
-                    raise GraphExecutionError(
-                        f"Unsupported node type '{node_type}' in node '{current_node_id}'."
-                    )
+                    return result
 
-                self._state_store.add_checkpoint(
-                    run_id=run_id,
-                    graph_id=graph_id,
-                    node_id=current_node_id,
-                    status="ok",
-                    input_payload=node_input,
-                    output_payload=output,
-                )
-
-                visited_nodes.append(current_node_id)
-                context[current_node_id] = output
-                context["last"] = output
-                last_output = output
-
-                if next_node is None:
-                    raise GraphExecutionError(f"Node '{current_node_id}' did not resolve a next node.")
                 current_node_id = next_node
 
         except Exception as exc:
@@ -218,6 +282,9 @@ class GraphExecutor:
                 input_payload=last_output,
                 output_payload=None,
                 error_text=str(exc),
+                context_payload=context,
+                next_node_id=current_node_id,
+                step=steps,
             )
             self._state_store.finish_run(
                 run_id=run_id,
@@ -225,9 +292,392 @@ class GraphExecutor:
                 output_payload=None,
                 error_text=str(exc),
             )
-            if isinstance(exc, GraphValidationError | GraphExecutionError):
+            await self._emit_hook(
+                "after_run",
+                {
+                    "run_id": run_id,
+                    "graph_id": graph_id,
+                    "status": "failed",
+                    "error": str(exc),
+                    "visited_nodes": visited_nodes,
+                },
+            )
+            if isinstance(exc, (GraphExecutionError, GraphValidationError)):
                 raise
             raise GraphExecutionError(str(exc)) from exc
+
+    async def replay(
+        self,
+        *,
+        run_id: str,
+        tool_map: dict[str, BaseTool] | None = None,
+        llm_client: LLMClient | None = None,
+    ) -> GraphExecutionResult:
+        run = self._state_store.get_run(run_id)
+        if run is None:
+            raise GraphExecutionError(f"Run '{run_id}' was not found.")
+
+        graph = self._state_store.get_graph_definition(run.graph_id)
+        if graph is None:
+            raise GraphExecutionError(
+                f"Graph '{run.graph_id}' for run '{run_id}' is not stored in graph_definitions."
+            )
+
+        return await self.arun(
+            graph=graph,
+            input_payload=run.input_payload,
+            guarantee_mode=run.guarantee_mode,
+            tool_map=tool_map,
+            llm_client=llm_client,
+            parent_run_id=run.run_id,
+            metadata={"replay_of": run.run_id},
+        )
+
+    async def resume(
+        self,
+        *,
+        run_id: str,
+        tool_map: dict[str, BaseTool] | None = None,
+        llm_client: LLMClient | None = None,
+    ) -> GraphExecutionResult:
+        run = self._state_store.get_run(run_id)
+        if run is None:
+            raise GraphExecutionError(f"Run '{run_id}' was not found.")
+
+        checkpoint = self._state_store.latest_error_checkpoint(run_id)
+        if checkpoint is None:
+            raise GraphExecutionError(f"Run '{run_id}' has no error checkpoint to resume from.")
+
+        graph = self._state_store.get_graph_definition(run.graph_id)
+        if graph is None:
+            raise GraphExecutionError(
+                f"Graph '{run.graph_id}' for run '{run_id}' is not stored in graph_definitions."
+            )
+
+        resume_context = checkpoint.context_payload
+        if not isinstance(resume_context, dict):
+            resume_context = {}
+
+        return await self.arun(
+            graph=graph,
+            input_payload=run.input_payload,
+            guarantee_mode=run.guarantee_mode,
+            tool_map=tool_map,
+            llm_client=llm_client,
+            start_node_id=checkpoint.node_id,
+            context_override=dict(resume_context),
+            parent_run_id=run.run_id,
+            resume_from_run_id=run.run_id,
+            metadata={"resume_of": run.run_id, "checkpoint_id": checkpoint.id},
+        )
+
+    def run(self, **kwargs: Any) -> GraphExecutionResult:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            raise RuntimeError("GraphExecutor.run() cannot be called inside an active event loop. Use await arun().")
+        return asyncio.run(self.arun(**kwargs))
+
+    async def _execute_node(
+        self,
+        *,
+        node: dict[str, Any],
+        node_input: object,
+        context: dict[str, object],
+        guarantee_mode: str,
+        tools: dict[str, BaseTool],
+        llm_client: LLMClient | None,
+    ) -> tuple[object, str | None]:
+        node_type = str(node["type"])
+
+        if node_type == "start":
+            return node_input, self._first_next(node)
+
+        if node_type == "end":
+            return node_input, self._first_next(node, allow_missing=True)
+
+        if node_type == "transform":
+            return self._resolve_value(node.get("value", node_input), context), self._first_next(node)
+
+        if node_type == "read_state":
+            key = str(node["key"])
+            return {"key": key, "value": self._state_store.read_state(graph_id=str(context["graph_id"]), key=key)}, self._first_next(node)
+
+        if node_type == "write_state":
+            key = str(node["key"])
+            value_source = node.get("value", node_input)
+            value = self._resolve_value(value_source, context)
+            self._state_store.write_state(
+                graph_id=str(context["graph_id"]),
+                key=key,
+                value=value,
+                source_run_id=str(context["run_id"]),
+                source_node_id=str(node["node_id"]),
+            )
+            return {"key": key, "value": value, "written": True}, self._first_next(node)
+
+        if node_type == "read_prior_runs":
+            limit = int(node.get("limit", 5))
+            runs = self._state_store.read_prior_runs(graph_id=str(context["graph_id"]), limit=limit)
+            return {
+                "count": len(runs),
+                "runs": [
+                    {
+                        "run_id": run.run_id,
+                        "status": run.status,
+                        "guarantee_mode": run.guarantee_mode,
+                        "started_at": run.started_at,
+                        "finished_at": run.finished_at,
+                        "error_text": run.error_text,
+                    }
+                    for run in runs
+                    if run.run_id != str(context["run_id"])
+                ],
+            }, self._first_next(node)
+
+        if node_type == "condition":
+            return await self._execute_condition_node(
+                node=node,
+                context=context,
+                guarantee_mode=guarantee_mode,
+                llm_client=llm_client,
+            )
+
+        if node_type == "tool":
+            return await self._execute_tool_node(node=node, node_input=node_input, context=context, tools=tools)
+
+        if node_type == "ai_template":
+            return await self._execute_ai_template_node(
+                node=node,
+                node_input=node_input,
+                context=context,
+                llm_client=llm_client,
+            )
+
+        raise GraphExecutionError(f"Unsupported node type '{node_type}' in node '{node.get('node_id')}'.")
+
+    async def _execute_tool_node(
+        self,
+        *,
+        node: dict[str, Any],
+        node_input: object,
+        context: dict[str, object],
+        tools: dict[str, BaseTool],
+    ) -> tuple[object, str | None]:
+        tool_name = node.get("tool") or node.get("tool_name")
+        if not isinstance(tool_name, str) or not tool_name:
+            raise GraphExecutionError(f"Tool node '{node.get('node_id')}' is missing non-empty 'tool'.")
+
+        tool = tools.get(tool_name)
+        if tool is None:
+            raise GraphExecutionError(
+                f"Tool node '{node.get('node_id')}' references unavailable tool '{tool_name}'."
+            )
+
+        args_source = node.get("args", node_input)
+        args_payload = self._resolve_value(args_source, context)
+        timeout = float(node.get("timeout_seconds", self._tool_timeout_seconds))
+        invocation_payload = self._coerce_tool_input(tool=tool, payload=args_payload)
+        output = await self._invoke_tool_with_retry(
+            tool=tool,
+            payload=invocation_payload,
+            timeout=timeout,
+        )
+
+        return output, self._first_next(node)
+
+    async def _invoke_tool_with_retry(self, *, tool: BaseTool, payload: object, timeout: float) -> object:
+        try:
+            return await asyncio.wait_for(tool.ainvoke(payload), timeout=timeout)
+        except TimeoutError as exc:
+            raise GraphExecutionError(
+                f"Tool '{tool.name}' timed out after {timeout:.1f}s."
+            ) from exc
+        except TypeError as exc:
+            if not self._looks_like_signature_mismatch(exc):
+                raise
+
+            fallback_payload = self._coerce_tool_input(tool=tool, payload=payload, force_single_input=True)
+            if fallback_payload == payload:
+                raise
+            try:
+                return await asyncio.wait_for(tool.ainvoke(fallback_payload), timeout=timeout)
+            except TimeoutError as timeout_exc:
+                raise GraphExecutionError(
+                    f"Tool '{tool.name}' timed out after {timeout:.1f}s."
+                ) from timeout_exc
+
+    def _coerce_tool_input(
+        self,
+        *,
+        tool: BaseTool,
+        payload: object,
+        force_single_input: bool = False,
+    ) -> object:
+        arg_names = self._tool_arg_names(tool)
+        if not arg_names:
+            return payload
+
+        if len(arg_names) == 1:
+            target_name = arg_names[0]
+            if isinstance(payload, Mapping) and target_name in payload and not force_single_input:
+                return payload
+            if isinstance(payload, Mapping) and set(payload.keys()).issubset(set(arg_names)) and not force_single_input:
+                return payload
+            return {target_name: payload}
+
+        if isinstance(payload, Mapping):
+            if set(payload.keys()).issubset(set(arg_names)):
+                return payload
+            if force_single_input:
+                first_name = arg_names[0]
+                return {first_name: payload}
+        return payload
+
+    def _tool_arg_names(self, tool: BaseTool) -> list[str]:
+        try:
+            schema = tool.get_input_schema().model_json_schema()
+        except Exception:  # noqa: BLE001
+            return []
+
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return []
+        return [name for name in properties.keys() if name != "kwargs"]
+
+    def _looks_like_signature_mismatch(self, error: TypeError) -> bool:
+        text = str(error)
+        return "missing" in text and "required positional argument" in text
+
+    async def _execute_ai_template_node(
+        self,
+        *,
+        node: dict[str, Any],
+        node_input: object,
+        context: dict[str, object],
+        llm_client: LLMClient | None,
+    ) -> tuple[object, str | None]:
+        if llm_client is None:
+            raise GraphExecutionError(
+                f"AI template node '{node.get('node_id')}' cannot execute because no LLM client is configured."
+            )
+
+        system_prompt = node.get("system_prompt")
+        prompt_template = node.get("prompt_template") or node.get("prompt")
+        if not isinstance(prompt_template, str) or not prompt_template.strip():
+            raise GraphExecutionError(
+                f"AI template node '{node.get('node_id')}' requires 'prompt_template' or 'prompt'."
+            )
+
+        rendered_prompt = self._render_template_string(prompt_template, context)
+        messages = []
+        if isinstance(system_prompt, str) and system_prompt.strip():
+            messages.append(SystemMessage(content=system_prompt))
+        messages.append(HumanMessage(content=rendered_prompt))
+
+        response = await llm_client.invoke(messages, tools=None, on_token=None)
+        content = response.content
+        if isinstance(content, str):
+            text = content
+        else:
+            text = str(content)
+
+        output_format = str(node.get("output_format", "text"))
+        output: object
+        if output_format == "json":
+            output = self._extract_json_payload(text)
+        else:
+            output = text
+
+        return output, self._first_next(node)
+
+    async def _execute_condition_node(
+        self,
+        *,
+        node: dict[str, Any],
+        context: dict[str, object],
+        guarantee_mode: str,
+        llm_client: LLMClient | None,
+    ) -> tuple[object, str | None]:
+        strategy = str(node.get("strategy"))
+
+        if strategy == "typed_condition":
+            result = self._evaluate_typed_condition(node=node, context=context)
+            next_node = str(node["if_true"] if result else node["if_false"])
+            return {
+                "strategy": strategy,
+                "result": result,
+                "next": next_node,
+            }, next_node
+
+        if strategy == "llm_condition":
+            options = node.get("branch_options")
+            if not isinstance(options, list) or not options:
+                raise GraphExecutionError(
+                    f"LLM condition node '{node.get('node_id')}' requires non-empty branch_options."
+                )
+
+            decision = self._resolve_value(node.get("decision"), context)
+            if not isinstance(decision, str) or decision not in options:
+                llm_prompt = node.get("llm_prompt") or node.get("prompt")
+                if isinstance(llm_prompt, str) and llm_prompt.strip():
+                    if llm_client is None:
+                        raise GraphExecutionError(
+                            f"LLM condition node '{node.get('node_id')}' requires an LLM client."
+                        )
+                    prompt = self._render_template_string(llm_prompt, context)
+                    choice_messages = [
+                        SystemMessage(
+                            content=(
+                                "Choose exactly one branch option and return strict JSON: "
+                                '{"branch":"<option>","reason":"..."}. '
+                                f"Allowed options: {options}."
+                            )
+                        ),
+                        HumanMessage(content=prompt),
+                    ]
+                    response = await llm_client.invoke(choice_messages, tools=None, on_token=None)
+                    response_text = response.content if isinstance(response.content, str) else str(response.content)
+                    payload = self._extract_json_payload(response_text)
+                    decision = payload.get("branch") if isinstance(payload, dict) else None
+
+            if not isinstance(decision, str) or decision not in options:
+                if guarantee_mode == "strict":
+                    raise GraphExecutionError(
+                        f"Strict mode requires llm_condition decision in branch_options for node '{node.get('node_id')}'."
+                    )
+                decision = str(options[0])
+
+            branch_targets = node.get("branch_targets")
+            if isinstance(branch_targets, dict) and decision in branch_targets:
+                next_node = str(branch_targets[decision])
+            else:
+                if len(options) == 1:
+                    next_node = str(node["if_true"])
+                elif decision == str(options[0]):
+                    next_node = str(node["if_true"])
+                else:
+                    next_node = str(node["if_false"])
+
+            return {
+                "strategy": strategy,
+                "decision": decision,
+                "next": next_node,
+            }, next_node
+
+        raise GraphExecutionError(
+            f"Unsupported condition strategy '{strategy}' in node '{node.get('node_id')}'."
+        )
+
+    async def _emit_hook(self, event: str, context: dict[str, Any]) -> None:
+        try:
+            await self._hooks.emit(event, context)
+        except Exception:  # noqa: BLE001
+            # Hooks should never break graph execution.
+            return
 
     def _validate_mode_policy(self, graph: dict[str, Any], guarantee_mode: str) -> None:
         violations: list[str] = []
@@ -236,32 +686,43 @@ class GraphExecutor:
             node_id = str(node.get("node_id"))
             node_type = str(node.get("type"))
 
-            if guarantee_mode in {"strict", "bounded"} and node_type in {"tool", "ai_template"}:
-                if "mock_output" not in node:
+            if node_type in {"tool", "ai_template"}:
+                if "idempotency_key" not in node and guarantee_mode == "strict":
                     violations.append(
-                        f"{guarantee_mode} mode requires 'mock_output' for node '{node_id}' "
-                        f"until live tool execution is integrated into graph runtime."
+                        f"Strict mode requires idempotency_key on node '{node_id}'."
+                    )
+                if "timeout_seconds" not in node and guarantee_mode in {"strict", "bounded"}:
+                    violations.append(
+                        f"{guarantee_mode} mode requires timeout_seconds on node '{node_id}'."
+                    )
+                if "max_retries" not in node and guarantee_mode in {"strict", "bounded"}:
+                    violations.append(
+                        f"{guarantee_mode} mode requires max_retries on node '{node_id}'."
                     )
 
             if guarantee_mode == "strict" and node_type == "condition":
                 strategy = node.get("strategy")
                 if strategy == "llm_condition":
                     options = node.get("branch_options")
-                    if not isinstance(options, list) or len(options) != 2:
+                    if not isinstance(options, list) or len(options) < 2:
                         violations.append(
-                            f"Strict mode requires llm_condition node '{node_id}' to provide exactly two branch_options."
+                            f"Strict mode requires llm_condition node '{node_id}' to provide at least two branch_options."
                         )
 
         if violations:
             rendered = "\n".join(f"- {item}" for item in violations)
             raise GraphExecutionError(f"Guarantee mode policy violation:\n{rendered}")
 
-    def _first_next(self, node: dict[str, Any]) -> str:
+    def _first_next(self, node: dict[str, Any], allow_missing: bool = False) -> str | None:
         raw_next = node.get("next")
+        if raw_next is None and allow_missing:
+            return None
         if isinstance(raw_next, str):
             return raw_next
         if isinstance(raw_next, list) and raw_next and isinstance(raw_next[0], str):
             return raw_next[0]
+        if allow_missing:
+            return None
         raise GraphExecutionError(f"Node '{node.get('node_id')}' has invalid 'next'.")
 
     def _evaluate_typed_condition(self, node: dict[str, Any], context: dict[str, object]) -> bool:
@@ -310,6 +771,18 @@ class GraphExecutor:
 
         return value
 
+    def _render_template_string(self, template: str, context: dict[str, object]) -> str:
+        def _replace(match: re.Match[str]) -> str:
+            path = match.group(1).strip()
+            value = self._resolve_path(path, context)
+            if value is None:
+                return ""
+            if isinstance(value, (dict, list)):
+                return json.dumps(value, ensure_ascii=False)
+            return str(value)
+
+        return TEMPLATE_INLINE_RE.sub(_replace, template)
+
     def _resolve_path(self, path: str, context: dict[str, object]) -> object:
         current: object = context
         for part in [piece for piece in path.split(".") if piece]:
@@ -324,3 +797,24 @@ class GraphExecutor:
                 continue
             return None
         return current
+
+    def _extract_json_payload(self, text: str) -> object:
+        raw = text.strip()
+        if not raw:
+            return {}
+        if raw.startswith("```"):
+            raw = self._strip_fenced_block(raw)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                return json.loads(raw[start : end + 1])
+            raise GraphExecutionError("Expected JSON output but could not parse model response.")
+
+    def _strip_fenced_block(self, raw: str) -> str:
+        lines = raw.splitlines()
+        if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].startswith("```"):
+            return "\n".join(lines[1:-1]).strip()
+        return raw
