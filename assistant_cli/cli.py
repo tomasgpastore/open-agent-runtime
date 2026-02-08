@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,13 @@ from rich.markdown import Markdown
 
 from assistant_cli.agent_graph import LangGraphAgent
 from assistant_cli.approval import ApprovalManager
+from assistant_cli.graph import (
+    GraphExecutionError,
+    GraphExecutor,
+    GraphStateStore,
+    GraphValidationError,
+    validate_graph_or_raise,
+)
 from assistant_cli.llm_client import (
     OpenAILLMClient,
     OpenAILLMConfig,
@@ -219,6 +227,8 @@ class AssistantCLI:
             token_limit=self.settings.short_term_token_limit,
             context_window=self.settings.model_context_window,
         )
+        self.graph_state_store = GraphStateStore(db_path=self.settings.sqlite_path)
+        self.graph_executor = GraphExecutor(state_store=self.graph_state_store)
 
         self.approval_manager = ApprovalManager()
         self.mcp_manager = MCPManager(
@@ -471,7 +481,13 @@ class AssistantCLI:
             self.console.print("Short-term session history was reset after provider switch.")
 
     async def _handle_command(self, command_line: str) -> bool:
-        parts = command_line.strip().split()
+        try:
+            parts = shlex.split(command_line.strip())
+        except ValueError:
+            self.console.print("Invalid command syntax.")
+            return False
+        if not parts:
+            return False
         command = parts[0].lower()
 
         if command == "/quit":
@@ -488,6 +504,10 @@ class AssistantCLI:
 
         if command == "/memory":
             self._handle_memory_command()
+            return False
+
+        if command == "/graph":
+            await self._handle_graph_command(parts[1:])
             return False
 
         if command == "/skills":
@@ -669,6 +689,265 @@ class AssistantCLI:
         for line in body.splitlines():
             self.console.print(f"- {line}")
         self.console.print()
+
+    async def _handle_graph_command(self, args: Sequence[str]) -> None:
+        if not args or args[0].lower() == "help":
+            self._print_graph_help()
+            return
+
+        action = args[0].lower()
+        if action == "list":
+            self._print_graph_list()
+            return
+
+        if action == "save":
+            if len(args) < 2:
+                self.console.print("Usage: /graph save <path.json>")
+                return
+            graph_path = Path(args[1]).expanduser()
+            try:
+                graph = self._load_graph_file(graph_path)
+                validate_graph_or_raise(graph)
+                self.graph_state_store.save_graph_definition(graph)
+            except (OSError, json.JSONDecodeError, GraphValidationError, ValueError) as exc:
+                self.console.print(f"Failed to save graph: {exc}")
+                return
+            self.console.print(f"Saved graph '{graph['id']}' from {graph_path}.")
+            return
+
+        if action == "validate":
+            if len(args) < 2:
+                self.console.print("Usage: /graph validate <path.json|graph_id>")
+                return
+            try:
+                graph, source = self._load_graph_reference(args[1])
+                validate_graph_or_raise(graph)
+            except (OSError, json.JSONDecodeError, GraphValidationError, ValueError) as exc:
+                self.console.print(f"Graph validation failed: {exc}")
+                return
+            self.console.print(f"Graph '{graph['id']}' is valid ({source}).")
+            return
+
+        if action == "show":
+            if len(args) < 2:
+                self.console.print("Usage: /graph show <path.json|graph_id>")
+                return
+            try:
+                graph, _ = self._load_graph_reference(args[1])
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                self.console.print(f"Failed to load graph: {exc}")
+                return
+            rendered = json.dumps(graph, ensure_ascii=False, indent=2)
+            self.console.print(rendered)
+            return
+
+        if action == "run":
+            if len(args) < 2:
+                self.console.print(
+                    "Usage: /graph run <path.json|graph_id> [--mode strict|bounded|flex] [--input path.json]"
+                )
+                return
+            graph_ref = args[1]
+            mode = "bounded"
+            input_payload: object = {}
+
+            index = 2
+            while index < len(args):
+                flag = args[index].lower()
+                if flag == "--mode":
+                    if index + 1 >= len(args):
+                        self.console.print("Missing value for --mode")
+                        return
+                    mode = args[index + 1].lower()
+                    index += 2
+                    continue
+                if flag == "--input":
+                    if index + 1 >= len(args):
+                        self.console.print("Missing value for --input")
+                        return
+                    input_path = Path(args[index + 1]).expanduser()
+                    try:
+                        input_payload = json.loads(input_path.read_text(encoding="utf-8"))
+                    except Exception as exc:  # noqa: BLE001
+                        self.console.print(f"Failed to load input payload: {exc}")
+                        return
+                    index += 2
+                    continue
+                self.console.print(f"Unknown /graph run option: {args[index]}")
+                return
+
+            try:
+                graph, _ = self._load_graph_reference(graph_ref)
+                validate_graph_or_raise(graph)
+                self.graph_state_store.save_graph_definition(graph)
+                result = self.graph_executor.run(
+                    graph=graph,
+                    input_payload=input_payload,
+                    guarantee_mode=mode,
+                )
+            except (
+                OSError,
+                json.JSONDecodeError,
+                GraphValidationError,
+                GraphExecutionError,
+                ValueError,
+            ) as exc:
+                self.console.print(f"Graph run failed: {exc}")
+                return
+
+            self.console.print("Graph Run")
+            self.console.print(f"- run_id: {result.run_id}")
+            self.console.print(f"- graph_id: {result.graph_id}")
+            self.console.print(f"- mode: {result.guarantee_mode}")
+            self.console.print(f"- status: {result.status}")
+            self.console.print(f"- visited_nodes: {', '.join(result.visited_nodes)}")
+            self.console.print(f"- output: {json.dumps(result.output, ensure_ascii=False)}")
+            self.console.print()
+            return
+
+        if action == "runs":
+            if len(args) < 2:
+                self.console.print("Usage: /graph runs <graph_id> [limit]")
+                return
+            graph_id = args[1]
+            limit = 10
+            if len(args) >= 3:
+                parsed = self._parse_positive_int(args[2])
+                if parsed is None:
+                    self.console.print("Limit must be a positive integer.")
+                    return
+                limit = parsed
+
+            runs = self.graph_state_store.read_prior_runs(graph_id=graph_id, limit=limit)
+            if not runs:
+                self.console.print(f"No runs found for graph '{graph_id}'.")
+                return
+            self.console.print(f"Runs for graph '{graph_id}'")
+            for run in runs:
+                self.console.print(
+                    f"- {run.run_id}: status={run.status}, mode={run.guarantee_mode}, "
+                    f"started={run.started_at}, finished={run.finished_at or '-'}"
+                )
+            self.console.print()
+            return
+
+        if action == "state":
+            await self._handle_graph_state_command(args[1:])
+            return
+
+        self.console.print(
+            "Usage: /graph <help|list|save|validate|show|run|runs|state ...>. Use /graph help for details."
+        )
+
+    async def _handle_graph_state_command(self, args: Sequence[str]) -> None:
+        if not args:
+            self.console.print("Usage: /graph state <show|get|history> ...")
+            return
+
+        action = args[0].lower()
+        if action == "show":
+            if len(args) < 2:
+                self.console.print("Usage: /graph state show <graph_id>")
+                return
+            graph_id = args[1]
+            state = self.graph_state_store.list_state(graph_id=graph_id)
+            if not state:
+                self.console.print(f"No state keys found for graph '{graph_id}'.")
+                return
+            self.console.print(f"State keys for graph '{graph_id}'")
+            for key, value in sorted(state.items()):
+                self.console.print(f"- {key}: {json.dumps(value, ensure_ascii=False)}")
+            self.console.print()
+            return
+
+        if action == "get":
+            if len(args) < 3:
+                self.console.print("Usage: /graph state get <graph_id> <key>")
+                return
+            graph_id = args[1]
+            key = args[2]
+            value = self.graph_state_store.read_state(graph_id=graph_id, key=key)
+            if value is None:
+                self.console.print(f"No value found for key '{key}' in graph '{graph_id}'.")
+                return
+            self.console.print(json.dumps(value, ensure_ascii=False, indent=2))
+            return
+
+        if action == "history":
+            if len(args) < 2:
+                self.console.print("Usage: /graph state history <graph_id> [limit]")
+                return
+            graph_id = args[1]
+            limit = 20
+            if len(args) >= 3:
+                parsed = self._parse_positive_int(args[2])
+                if parsed is None:
+                    self.console.print("Limit must be a positive integer.")
+                    return
+                limit = parsed
+
+            events = self.graph_state_store.list_events(graph_id=graph_id, limit=limit)
+            if not events:
+                self.console.print(f"No state events found for graph '{graph_id}'.")
+                return
+            self.console.print(f"State events for graph '{graph_id}'")
+            for event in events:
+                payload = json.dumps(event["payload"], ensure_ascii=False)
+                self.console.print(
+                    f"- {event['created_at']}: {event['event_type']} run={event['run_id'] or '-'} payload={payload}"
+                )
+            self.console.print()
+            return
+
+        self.console.print("Usage: /graph state <show|get|history> ...")
+
+    def _print_graph_help(self) -> None:
+        self.console.print("Graph Commands")
+        self.console.print("- /graph list")
+        self.console.print("- /graph save <path.json>")
+        self.console.print("- /graph validate <path.json|graph_id>")
+        self.console.print("- /graph show <path.json|graph_id>")
+        self.console.print("- /graph run <path.json|graph_id> [--mode strict|bounded|flex] [--input path.json]")
+        self.console.print("- /graph runs <graph_id> [limit]")
+        self.console.print("- /graph state show <graph_id>")
+        self.console.print("- /graph state get <graph_id> <key>")
+        self.console.print("- /graph state history <graph_id> [limit]")
+        self.console.print()
+
+    def _print_graph_list(self) -> None:
+        graphs = self.graph_state_store.list_graph_definitions(limit=50)
+        if not graphs:
+            self.console.print("No graphs saved yet.")
+            return
+        self.console.print("Saved Graphs")
+        for item in graphs:
+            self.console.print(f"- {item['graph_id']}: {item['name']} (updated: {item['updated_at']})")
+        self.console.print()
+
+    def _load_graph_reference(self, graph_ref: str) -> tuple[dict[str, object], str]:
+        path = Path(graph_ref).expanduser()
+        if path.exists():
+            return self._load_graph_file(path), str(path)
+
+        graph = self.graph_state_store.get_graph_definition(graph_ref)
+        if graph is None:
+            raise ValueError(f"Graph '{graph_ref}' was not found as a file path or saved graph id.")
+        return graph, f"graph_id:{graph_ref}"
+
+    def _load_graph_file(self, graph_path: Path) -> dict[str, object]:
+        payload = json.loads(graph_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Graph file must contain a JSON object.")
+        return payload
+
+    def _parse_positive_int(self, raw: str) -> int | None:
+        try:
+            value = int(raw)
+        except ValueError:
+            return None
+        if value <= 0:
+            return None
+        return value
 
     def _handle_skills_command(self, args: Sequence[str]) -> None:
         if not args or args[0].lower() == "list":
@@ -1008,6 +1287,7 @@ class AssistantCLI:
             ("/approval global on|off", "Toggle global approval"),
             ("/approval tool <tool> on|off", "Toggle approval for one tool"),
             ("/memory", "Show short-term memory stats"),
+            ("/graph", "Manage and execute automation graphs"),
             ("/skills", "List available skills"),
             ("/skills refresh", "Rescan skill directories"),
             ("/skills show <name>", "Show full SKILL.md instructions"),
@@ -1038,6 +1318,7 @@ class AssistantCLI:
             "/mcp",
             "/approval",
             "/memory",
+            "/graph",
             "/skills",
             "/paths",
             "/llm",
@@ -1055,6 +1336,19 @@ class AssistantCLI:
             return ["list", "add <path>", "add downloads", "add desktop", "add documents", "remove <path>"]
         if root_command == "/llm":
             return ["local <model>", "openai <model>", "openrouter <model>"]
+        if root_command == "/graph":
+            return [
+                "help",
+                "list",
+                "save <path.json>",
+                "validate <path.json|graph_id>",
+                "show <path.json|graph_id>",
+                "run <path.json|graph_id> --mode strict|bounded|flex --input <path.json>",
+                "runs <graph_id> [limit]",
+                "state show <graph_id>",
+                "state get <graph_id> <key>",
+                "state history <graph_id> [limit]",
+            ]
         if root_command == "/skills":
             return ["list", "refresh", "show <name>", "paths"]
         return []
