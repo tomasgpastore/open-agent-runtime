@@ -73,3 +73,66 @@ The core differentiator is controlled tool orchestration through graph execution
 - No direct graph-state mutation from tool or AI nodes
 - Validation and policy gates must run before execution
 - Every run must be auditable and replay-debuggable via checkpoints
+
+## Current Status (Implemented)
+- Graph runtime scaffold exists (`schema`, `state_store`, `executor`).
+- `/graph` CLI supports `list`, `save`, `validate`, `show`, `run`, `runs`, and `state` inspection.
+- Execution guarantee modes are wired: `strict`, `bounded`, `flex`.
+- State-aware nodes are wired: `read_state`, `write_state`, `read_prior_runs`.
+- Daily memory baseline is implemented:
+  - append-only `.md` files per day
+  - token chunking with overlap
+  - CLI retrieval (`/memory daily days`, `/memory daily search`)
+
+## Next Steps (Immediate)
+1. Replace `mock_output` execution for `tool` and `ai_template` nodes with real runtime adapters.
+2. Integrate Graph Builder Anton to generate schema-valid graph JSON from intent.
+3. Add run replay and checkpoint resume controls in CLI (`/graph replay`, `/graph resume`).
+4. Add stronger policy enforcement for strict mode (idempotency, timeouts, retry caps per node).
+5. Expand graph tests with failure injection and replay determinism checks.
+
+## Deferred v0.2 Backlog (Implement Later)
+### Agent Layer
+- Graph Builder Anton:
+  - constrained output to internal graph schema
+  - template registry for AI nodes
+  - iterative edit flow for user-directed node changes
+- Error Handler Anton:
+  - policy/runbook-driven remediation only
+  - bounded retry/backoff and escalation decisions
+  - no unrestricted autonomous actions
+
+### Graph UX
+- Graph renderer in UI for node/edge visualization.
+- Node-level editing from UI and prompt-based graph patching.
+- Graph diff/history view before execution.
+
+### Scheduler and Automation
+- Full in-app scheduler (cron-like) persisted in SQLite.
+- External trigger endpoint/command contracts for hybrid orchestration.
+- Scheduled run audit logs and failure notifications.
+
+### Memory v0.2 Expansion
+- Long-term fact memory lifecycle:
+  - extraction rules
+  - update/merge
+  - expiry/pruning of stale facts
+- Semantic retrieval upgrade path:
+  - keep local baseline now
+  - add pluggable embedding index backends later
+- Retrieval planner across hot state, daily archive, and long-term facts.
+
+### Hooks
+- Lifecycle hooks implementation:
+  - before_run
+  - after_run
+  - before_node
+  - after_node
+  - on_error
+- Hook safety model and side-effect boundaries.
+
+### Cloud Version (Cloud-Ready -> Full Cloud)
+- Hosted MCP execution path with user JWT identity propagation.
+- Encrypted OAuth token storage/retrieval on server side.
+- Cloud run workers so scheduled graphs execute while user machine is offline.
+- Local/cloud execution backend abstraction and compatibility tests.
