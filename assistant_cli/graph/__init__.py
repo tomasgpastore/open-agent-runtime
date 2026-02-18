@@ -1,4 +1,15 @@
 from assistant_cli.graph.builder import GraphBuildResult, GraphBuilderAnton
+from assistant_cli.graph.compiler import (
+    CompileDiagnostic,
+    CompileOptions,
+    CompileResult,
+    CompileTargetMode,
+    CompiledGraph,
+    CompiledNode,
+    GraphCompiler,
+    render_diagnostic,
+    render_diagnostics,
+)
 from assistant_cli.graph.executor import GraphExecutionError, GraphExecutionResult, GraphExecutor
 from assistant_cli.graph.error_handler import ErrorHandlerAnton, ErrorHandlingDecision
 from assistant_cli.graph.hooks import DEFAULT_HOOK_EVENTS, GraphHookRegistry, HookInvocation
@@ -22,6 +33,15 @@ __all__ = [
     "ErrorHandlingDecision",
     "GraphBuilderAnton",
     "GraphBuildResult",
+    "GraphCompiler",
+    "CompileOptions",
+    "CompileResult",
+    "CompileDiagnostic",
+    "CompileTargetMode",
+    "CompiledGraph",
+    "CompiledNode",
+    "render_diagnostic",
+    "render_diagnostics",
     "GraphExecutionError",
     "GraphExecutionResult",
     "GraphExecutor",

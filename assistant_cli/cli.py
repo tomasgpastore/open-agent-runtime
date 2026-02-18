@@ -40,6 +40,7 @@ from assistant_cli.graph import (
     GraphValidationError,
     validate_graph_or_raise,
 )
+from assistant_cli.graph.compiler import CompileOptions, GraphCompiler, render_diagnostics
 from assistant_cli.graph.scheduler import GraphScheduler
 from assistant_cli.llm_client import (
     LLMClient,
@@ -266,11 +267,13 @@ class AssistantCLI:
 
         self.graph_hooks = GraphHookRegistry()
         self.error_handler_anton = ErrorHandlerAnton()
+        self.graph_compiler = GraphCompiler()
         self.graph_executor = GraphExecutor(
             state_store=self.graph_state_store,
             llm_client=llm_client,
             hook_registry=self.graph_hooks,
             error_handler=self.error_handler_anton,
+            compiler=self.graph_compiler,
             tool_timeout_seconds=float(self.settings.tool_timeout_seconds),
         )
         self.graph_builder = GraphBuilderAnton(llm_client=llm_client)
@@ -1054,36 +1057,134 @@ class AssistantCLI:
                 self.console.print("Intent text is required.")
                 return
             try:
+                active_tools = self._active_tool_map()
                 built = await self.graph_builder.build_from_intent(
                     intent=intent,
-                    available_tools=sorted(self._active_tool_map().keys()),
+                    available_tools=sorted(active_tools.keys()),
                 )
-                validate_graph_or_raise(built.graph)
-                self.graph_state_store.save_graph_definition(built.graph)
+                compiled = self.graph_compiler.compile(
+                    graph=built.graph,
+                    tool_map=active_tools,
+                    options=CompileOptions(mode="bounded"),
+                )
+                if not compiled.ok or compiled.rewritten_graph is None:
+                    rendered = render_diagnostics(compiled.diagnostics)
+                    raise GraphExecutionError(f"Compile failed:\n{rendered}")
+                graph_to_save = compiled.rewritten_graph
+                validate_graph_or_raise(graph_to_save)
+                self.graph_state_store.save_graph_definition(graph_to_save)
             except (GraphValidationError, GraphExecutionError, ValueError) as exc:
                 self.console.print(f"Failed to build graph: {exc}")
                 return
             self.console.print(
-                f"Built graph '{built.graph['id']}' (source={built.source}, attempts={built.attempts})."
+                f"Built graph '{graph_to_save['id']}' (source={built.source}, attempts={built.attempts})."
             )
-            if built.warnings:
+            compiler_warnings = [
+                item for item in compiled.diagnostics if item.severity in {"warning", "info"}
+            ]
+            if built.warnings or compiler_warnings:
                 self.console.print("Warnings:")
                 for warning in built.warnings:
                     self.console.print(f"- {warning}")
-            self.console.print(json.dumps(built.graph, ensure_ascii=False, indent=2))
+                for warning in compiler_warnings:
+                    self.console.print(f"- {warning.code}: {warning.message}")
+            self.console.print(json.dumps(graph_to_save, ensure_ascii=False, indent=2))
             return
 
         if action == "validate":
             if len(args) < 2:
-                self.console.print("Usage: /graph validate <path.json|graph_id>")
+                self.console.print("Usage: /graph validate <path.json|graph_id> [--mode strict|bounded|flex]")
+                return
+            mode = "bounded"
+            index = 2
+            while index < len(args):
+                flag = args[index].lower()
+                if flag == "--mode":
+                    if index + 1 >= len(args):
+                        self.console.print("Missing value for --mode")
+                        return
+                    mode = args[index + 1].lower()
+                    index += 2
+                    continue
+                self.console.print(f"Unknown /graph validate option: {args[index]}")
                 return
             try:
                 graph, source = self._load_graph_reference(args[1])
-                validate_graph_or_raise(graph)
+                compiled = self.graph_compiler.compile(
+                    graph=graph,
+                    tool_map=self._active_tool_map(),
+                    options=CompileOptions(mode=mode),
+                )
             except (OSError, json.JSONDecodeError, GraphValidationError, ValueError) as exc:
                 self.console.print(f"Graph validation failed: {exc}")
                 return
-            self.console.print(f"Graph '{graph['id']}' is valid ({source}).")
+            if not compiled.ok:
+                rendered = render_diagnostics(compiled.diagnostics)
+                self.console.print(f"Graph validation failed ({source}):\n{rendered}")
+                return
+            self.console.print(f"Graph '{graph['id']}' compiled successfully ({source}, mode={mode}).")
+            warnings = [item for item in compiled.diagnostics if item.severity in {"warning", "info"}]
+            if warnings:
+                self.console.print("Diagnostics:")
+                self.console.print(render_diagnostics(warnings))
+            return
+
+        if action == "compile":
+            if len(args) < 2:
+                self.console.print(
+                    "Usage: /graph compile <path.json|graph_id> [--mode strict|bounded|flex] [--rewrite]"
+                )
+                return
+            mode = "bounded"
+            rewrite = False
+            index = 2
+            while index < len(args):
+                flag = args[index].lower()
+                if flag == "--mode":
+                    if index + 1 >= len(args):
+                        self.console.print("Missing value for --mode")
+                        return
+                    mode = args[index + 1].lower()
+                    index += 2
+                    continue
+                if flag == "--rewrite":
+                    rewrite = True
+                    index += 1
+                    continue
+                self.console.print(f"Unknown /graph compile option: {args[index]}")
+                return
+            try:
+                graph, source = self._load_graph_reference(args[1])
+                compiled = self.graph_compiler.compile(
+                    graph=graph,
+                    tool_map=self._active_tool_map(),
+                    options=CompileOptions(mode=mode),
+                )
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                self.console.print(f"Graph compile failed: {exc}")
+                return
+            if not compiled.ok or compiled.compiled is None or compiled.rewritten_graph is None:
+                rendered = render_diagnostics(compiled.diagnostics)
+                self.console.print(f"Graph compile failed ({source}):\n{rendered}")
+                return
+            if rewrite:
+                if source.startswith("graph_id:"):
+                    self.graph_state_store.save_graph_definition(compiled.rewritten_graph)
+                else:
+                    Path(source).write_text(
+                        json.dumps(compiled.rewritten_graph, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+            self.console.print(
+                f"Graph '{compiled.compiled.graph_id}' compiled (mode={mode}, hash={compiled.compiled.compile_hash})."
+            )
+            if rewrite:
+                self.console.print(f"Rewritten graph persisted to {source}.")
+            warnings = [item for item in compiled.diagnostics if item.severity in {"warning", "info"}]
+            if warnings:
+                self.console.print("Diagnostics:")
+                self.console.print(render_diagnostics(warnings))
+            self.console.print(json.dumps(compiled.rewritten_graph, ensure_ascii=False, indent=2))
             return
 
         if action == "show":
@@ -1176,11 +1277,20 @@ class AssistantCLI:
 
             try:
                 graph, _ = self._load_graph_reference(graph_ref)
-                validate_graph_or_raise(graph)
-                self.graph_state_store.save_graph_definition(graph)
-                self._active_tool_map()
-                result = await self.execution_backend.run_graph(
+                active_tools = self._active_tool_map()
+                compiled = self.graph_compiler.compile(
                     graph=graph,
+                    tool_map=active_tools,
+                    options=CompileOptions(mode=mode),
+                )
+                if not compiled.ok or compiled.rewritten_graph is None:
+                    rendered = render_diagnostics(compiled.diagnostics)
+                    raise GraphExecutionError(f"Graph compile failed:\n{rendered}")
+                graph_to_run = compiled.rewritten_graph
+                validate_graph_or_raise(graph_to_run)
+                self.graph_state_store.save_graph_definition(graph_to_run)
+                result = await self.execution_backend.run_graph(
+                    graph=graph_to_run,
                     input_payload=input_payload,
                     guarantee_mode=mode,
                     trigger_source="manual:/graph run",
@@ -1262,7 +1372,7 @@ class AssistantCLI:
             return
 
         self.console.print(
-            "Usage: /graph <help|list|save|build|validate|show|render|patch|run|replay|resume|runs|state|schedule ...>."
+            "Usage: /graph <help|list|save|build|compile|validate|show|render|patch|run|replay|resume|runs|state|schedule ...>."
         )
 
     async def _handle_graph_state_command(self, args: Sequence[str]) -> None:
@@ -1501,7 +1611,8 @@ class AssistantCLI:
         self.console.print("- /graph list")
         self.console.print("- /graph save <path.json>")
         self.console.print("- /graph build <intent text>")
-        self.console.print("- /graph validate <path.json|graph_id>")
+        self.console.print("- /graph compile <path.json|graph_id> [--mode strict|bounded|flex] [--rewrite]")
+        self.console.print("- /graph validate <path.json|graph_id> [--mode strict|bounded|flex]")
         self.console.print("- /graph show <path.json|graph_id>")
         self.console.print("- /graph render <path.json|graph_id>")
         self.console.print("- /graph patch <graph_id> <node_id> <field> <json_value>")
@@ -2093,7 +2204,8 @@ class AssistantCLI:
                 "list",
                 "save <path.json>",
                 "build <intent text>",
-                "validate <path.json|graph_id>",
+                "compile <path.json|graph_id> --mode strict|bounded|flex --rewrite",
+                "validate <path.json|graph_id> --mode strict|bounded|flex",
                 "show <path.json|graph_id>",
                 "render <path.json|graph_id>",
                 "patch <graph_id> <node_id> <field> <json_value>",

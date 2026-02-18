@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from datetime import datetime
 import json
 import re
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 
+from assistant_cli.graph.compiler import CompileOptions, CompiledGraph, GraphCompiler, render_diagnostics
 from assistant_cli.graph.error_handler import ErrorHandlerAnton
 from assistant_cli.graph.hooks import GraphHookRegistry
 from assistant_cli.graph.schema import (
@@ -49,12 +51,14 @@ class GraphExecutor:
         llm_client: LLMClient | None = None,
         hook_registry: GraphHookRegistry | None = None,
         error_handler: ErrorHandlerAnton | None = None,
+        compiler: GraphCompiler | None = None,
         tool_timeout_seconds: float = 45.0,
     ) -> None:
         self._state_store = state_store
         self._llm_client = llm_client
         self._hooks = hook_registry or GraphHookRegistry()
         self._error_handler = error_handler or ErrorHandlerAnton()
+        self._compiler = compiler or GraphCompiler()
         self._tool_timeout_seconds = max(1.0, float(tool_timeout_seconds))
 
     def set_llm_client(self, llm_client: LLMClient) -> None:
@@ -72,6 +76,7 @@ class GraphExecutor:
         guarantee_mode: str = "bounded",
         tool_map: dict[str, BaseTool] | None = None,
         llm_client: LLMClient | None = None,
+        compiled_graph: CompiledGraph | None = None,
         start_node_id: str | None = None,
         context_override: dict[str, object] | None = None,
         parent_run_id: str | None = None,
@@ -83,16 +88,45 @@ class GraphExecutor:
                 f"Unsupported guarantee_mode '{guarantee_mode}'. Use strict, bounded, or flex."
             )
 
-        validate_graph_or_raise(graph)
-        self._validate_mode_policy(graph, guarantee_mode)
-
         active_llm_client = llm_client or self._llm_client
         active_tools = tool_map or {}
+        active_compiled = compiled_graph
+
+        if active_compiled is None:
+            compile_result = self._compiler.compile(
+                graph=graph,
+                tool_map=active_tools,
+                options=CompileOptions(mode=guarantee_mode),
+            )
+            if not compile_result.ok or compile_result.compiled is None:
+                rendered = render_diagnostics(compile_result.diagnostics)
+                raise GraphExecutionError(f"Graph compilation failed:\n{rendered}")
+            active_compiled = compile_result.compiled
+            if compile_result.rewritten_graph is not None:
+                graph = compile_result.rewritten_graph
+        else:
+            if active_compiled.mode != guarantee_mode:
+                raise GraphExecutionError(
+                    "Provided compiled_graph mode does not match requested guarantee_mode."
+                )
+            graph = active_compiled.graph
+
+        validate_graph_or_raise(graph)
+        self._validate_mode_policy(graph, guarantee_mode)
 
         graph_id = str(graph["id"])
         nodes = graph["nodes"]
         node_map = {str(node["node_id"]): node for node in nodes}
         max_steps = int(graph.get("max_steps", max(20, len(nodes) * 12)))
+
+        run_metadata = dict(metadata or {})
+        if active_compiled is not None:
+            run_metadata["compile"] = {
+                "compiler_version": active_compiled.compiler_version,
+                "compile_hash": active_compiled.compile_hash,
+                "mode": active_compiled.mode,
+                "warning_count": len(active_compiled.warnings),
+            }
 
         run_id = self._state_store.start_run(
             graph_id=graph_id,
@@ -100,11 +134,12 @@ class GraphExecutor:
             input_payload=input_payload,
             parent_run_id=parent_run_id,
             resume_from_run_id=resume_from_run_id,
-            metadata=metadata,
+            metadata=run_metadata,
         )
 
         current_node_id = start_node_id or str(graph["start"])
         context: dict[str, object] = dict(context_override or {})
+        now = datetime.now().astimezone()
         context.update(
             {
                 "input": input_payload,
@@ -112,6 +147,9 @@ class GraphExecutor:
                 "graph_id": graph_id,
             }
         )
+        context.setdefault("date", now.date().isoformat())
+        context.setdefault("datetime", now.isoformat())
+        context.setdefault("now", now.isoformat())
 
         visited_nodes: list[str] = []
         node_retries: dict[str, int] = {}
@@ -477,7 +515,11 @@ class GraphExecutor:
                 f"Tool node '{node.get('node_id')}' references unavailable tool '{tool_name}'."
             )
 
-        args_source = node.get("args", node_input)
+        args_source = node.get("args")
+        if args_source is None:
+            args_source = node.get("parameters")
+        if args_source is None:
+            args_source = node_input
         args_payload = self._resolve_value(args_source, context)
         timeout = float(node.get("timeout_seconds", self._tool_timeout_seconds))
         invocation_payload = self._coerce_tool_input(tool=tool, payload=args_payload)
@@ -519,22 +561,24 @@ class GraphExecutor:
     ) -> object:
         arg_names = self._tool_arg_names(tool)
         if not arg_names:
+            if isinstance(payload, Mapping):
+                return self._coerce_mapping_payload(tool=tool, payload=payload)
             return payload
 
         if len(arg_names) == 1:
             target_name = arg_names[0]
             if isinstance(payload, Mapping) and target_name in payload and not force_single_input:
-                return payload
+                return self._coerce_mapping_payload(tool=tool, payload=payload)
             if isinstance(payload, Mapping) and set(payload.keys()).issubset(set(arg_names)) and not force_single_input:
-                return payload
-            return {target_name: payload}
+                return self._coerce_mapping_payload(tool=tool, payload=payload)
+            return self._coerce_mapping_payload(tool=tool, payload={target_name: payload})
 
         if isinstance(payload, Mapping):
             if set(payload.keys()).issubset(set(arg_names)):
-                return payload
+                return self._coerce_mapping_payload(tool=tool, payload=payload)
             if force_single_input:
                 first_name = arg_names[0]
-                return {first_name: payload}
+                return self._coerce_mapping_payload(tool=tool, payload={first_name: payload})
         return payload
 
     def _tool_arg_names(self, tool: BaseTool) -> list[str]:
@@ -547,6 +591,67 @@ class GraphExecutor:
         if not isinstance(properties, dict):
             return []
         return [name for name in properties.keys() if name != "kwargs"]
+
+    def _tool_schema_properties(self, tool: BaseTool) -> dict[str, object]:
+        try:
+            schema = tool.get_input_schema().model_json_schema()
+        except Exception:  # noqa: BLE001
+            return {}
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return {}
+        return properties
+
+    def _coerce_mapping_payload(self, *, tool: BaseTool, payload: Mapping[str, object]) -> dict[str, object]:
+        properties = self._tool_schema_properties(tool)
+        coerced = dict(payload)
+
+        if properties:
+            for key, value in list(coerced.items()):
+                schema = properties.get(key)
+                if isinstance(schema, dict):
+                    coerced[key] = self._coerce_value_for_schema(value=value, schema=schema)
+
+        if self._looks_like_email_send_tool(tool=tool):
+            to_value = coerced.get("to")
+            if isinstance(to_value, str):
+                parts = [item.strip() for item in to_value.split(",") if item.strip()]
+                coerced["to"] = parts if parts else [to_value]
+
+        return coerced
+
+    def _coerce_value_for_schema(self, *, value: object, schema: dict[str, object]) -> object:
+        if self._schema_accepts_type(schema=schema, expected_type="array"):
+            if isinstance(value, str):
+                return [value]
+        if self._schema_accepts_type(schema=schema, expected_type="string"):
+            if isinstance(value, list) and len(value) == 1 and isinstance(value[0], str):
+                return value[0]
+        return value
+
+    def _schema_accepts_type(self, *, schema: dict[str, object], expected_type: str) -> bool:
+        type_field = schema.get("type")
+        if isinstance(type_field, str) and type_field == expected_type:
+            return True
+        if isinstance(type_field, list) and expected_type in type_field:
+            return True
+
+        for variant_key in ("anyOf", "oneOf", "allOf"):
+            variants = schema.get(variant_key)
+            if not isinstance(variants, list):
+                continue
+            for variant in variants:
+                if isinstance(variant, dict) and self._schema_accepts_type(
+                    schema=variant, expected_type=expected_type
+                ):
+                    return True
+        return False
+
+    def _looks_like_email_send_tool(self, *, tool: BaseTool) -> bool:
+        name = str(getattr(tool, "name", "")).strip().lower()
+        if name in {"send_email", "draft_email"}:
+            return True
+        return name.endswith(".send_email") or name.endswith(".draft_email")
 
     def _looks_like_signature_mismatch(self, error: TypeError) -> bool:
         text = str(error)
@@ -758,10 +863,12 @@ class GraphExecutor:
     def _resolve_value(self, value: object, context: dict[str, object]) -> object:
         if isinstance(value, str):
             match = TEMPLATE_VALUE_RE.fullmatch(value.strip())
-            if not match:
-                return value
-            path = match.group(1).strip()
-            return self._resolve_path(path, context)
+            if match:
+                path = match.group(1).strip()
+                return self._resolve_path(path, context)
+            if "{{" in value and "}}" in value:
+                return self._render_template_string(value, context)
+            return value
 
         if isinstance(value, dict):
             return {key: self._resolve_value(item, context) for key, item in value.items()}
@@ -787,13 +894,21 @@ class GraphExecutor:
         current: object = context
         for part in [piece for piece in path.split(".") if piece]:
             if isinstance(current, dict):
-                current = current.get(part)
-                continue
+                if part in current:
+                    current = current.get(part)
+                    continue
+                # Compat shim: treat "{{node.output}}" as "{{node}}" when node output
+                # is stored directly in context.
+                if part == "output":
+                    continue
+                return None
             if isinstance(current, list) and part.isdigit():
                 idx = int(part)
                 if idx < 0 or idx >= len(current):
                     return None
                 current = current[idx]
+                continue
+            if part == "output":
                 continue
             return None
         return current
