@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import re
 import uuid
 from dataclasses import dataclass
@@ -101,6 +102,8 @@ class GraphBuilderAnton:
                 "You are Graph Builder Anton. Output ONLY valid JSON for Anton graph schema. "
                 "No markdown, no prose. Use explicit node_id values and valid next edges. "
                 "Use tool nodes only with available tool names. "
+                "For every node include input_schema/output_schema contract objects "
+                "(except start can omit input_schema and end can omit output_schema). "
                 "For tool/ai_template nodes include timeout_seconds, max_retries, idempotency_key."
             )
         )
@@ -112,6 +115,7 @@ class GraphBuilderAnton:
                 f"Available tools: {tool_list}\n"
                 "Guarantee-compatible defaults:\n"
                 "- execution_defaults.guarantee_mode = bounded\n"
+                "- execution_defaults.ai_edge_policy = always\n"
                 "- state_access.default_enabled = false\n"
                 "- include start and end nodes\n"
                 "- condition nodes require strategy, if_true, if_false\n"
@@ -121,7 +125,7 @@ class GraphBuilderAnton:
         )
 
         response = await self._llm_client.invoke([system, human], tools=None, on_token=None)
-        raw = response.content if isinstance(response.content, str) else str(response.content)
+        raw = self._message_content_to_text(response.content)
         return self._extract_json(raw)
 
     def patch_node_field(
@@ -177,6 +181,151 @@ class GraphBuilderAnton:
     ) -> dict[str, Any]:
         tool_name = available_tools[0] if available_tools else "noop_tool"
         summary = intent.strip() or "automation"
+        search_tool = self._pick_tool(
+            available_tools,
+            [
+                "search_emails",
+                "gmail_autoauth_search_emails",
+                "read_email",
+                "gmail_autoauth_read_email",
+            ],
+        )
+        write_tool = self._pick_tool(
+            available_tools,
+            [
+                "write_file",
+                "filesystem_write_file",
+            ],
+        )
+        output_path = self._normalize_output_path(
+            self._extract_markdown_path(intent) or "./reports/automation_summary.md"
+        )
+        create_dir_tool = self._pick_tool(
+            available_tools,
+            [
+                "create_directory",
+                "filesystem_create_directory",
+            ],
+        )
+        reports_dir = str(Path(output_path).parent)
+        if not reports_dir:
+            reports_dir = "."
+        next_after_classification = (
+            "ensure_reports_dir" if create_dir_tool and reports_dir not in {"", "."} else "write_markdown_summary"
+        )
+
+        if search_tool and write_tool:
+            nodes: list[dict[str, Any]] = [
+                {
+                    "node_id": "start",
+                    "type": "start",
+                    "output_schema": {"type": "any"},
+                    "next": "fetch_unread_gmail",
+                },
+                {
+                    "node_id": "fetch_unread_gmail",
+                    "type": "tool",
+                    "tool": search_tool,
+                    "args": {
+                        "query": "is:unread newer_than:1d",
+                        "max_results": 50,
+                    },
+                    "input_schema": {"type": "any"},
+                    "output_schema": {"type": "any"},
+                    "timeout_seconds": 45,
+                    "max_retries": 2,
+                    "idempotency_key": f"{graph_id}:fetch_unread_gmail",
+                    "next": "classify_urgency",
+                },
+                {
+                    "node_id": "classify_urgency",
+                    "type": "ai_template",
+                    "prompt_template": (
+                        "You are classifying unread Gmail messages by urgency.\n"
+                        "Input messages: {{fetch_unread_gmail}}\n"
+                        "Return JSON with keys: total_count, urgent_count, medium_count, "
+                        "low_count, urgent_items (array), summary_markdown (string). "
+                        "summary_markdown must be a readable markdown report."
+                    ),
+                    "input_schema": {"type": "any"},
+                    "output_schema": {
+                        "type": "object",
+                        "properties": {
+                            "total_count": {"type": "integer"},
+                            "urgent_count": {"type": "integer"},
+                            "medium_count": {"type": "integer"},
+                            "low_count": {"type": "integer"},
+                            "urgent_items": {
+                                "type": "array",
+                                "items": {"type": "object"},
+                            },
+                            "summary_markdown": {"type": "string"},
+                        },
+                        "required": ["summary_markdown"],
+                        "additionalProperties": True,
+                    },
+                    "output_format": "json",
+                    "timeout_seconds": 45,
+                    "max_retries": 2,
+                    "idempotency_key": f"{graph_id}:classify_urgency",
+                    "next": next_after_classification,
+                },
+            ]
+
+            if create_dir_tool and reports_dir not in {"", "."}:
+                nodes.append(
+                    {
+                        "node_id": "ensure_reports_dir",
+                        "type": "tool",
+                        "tool": create_dir_tool,
+                        "args": {"path": reports_dir},
+                        "input_schema": {"type": "any"},
+                        "output_schema": {"type": "any"},
+                        "timeout_seconds": 45,
+                        "max_retries": 1,
+                        "idempotency_key": f"{graph_id}:ensure_reports_dir",
+                        "next": "write_markdown_summary",
+                    }
+                )
+
+            nodes.extend(
+                [
+                    {
+                        "node_id": "write_markdown_summary",
+                        "type": "tool",
+                        "tool": write_tool,
+                        "args": {
+                            "path": output_path,
+                            "content": "{{classify_urgency.summary_markdown}}",
+                        },
+                        "input_schema": {"type": "any"},
+                        "output_schema": {"type": "any"},
+                        "timeout_seconds": 45,
+                        "max_retries": 2,
+                        "idempotency_key": f"{graph_id}:write_markdown_summary",
+                        "next": "end",
+                    },
+                    {
+                        "node_id": "end",
+                        "type": "end",
+                        "input_schema": {"type": "any"},
+                    },
+                ]
+            )
+
+            return {
+                "id": graph_id,
+                "name": graph_name,
+                "description": summary,
+                "start": "start",
+                "execution_defaults": {
+                    "guarantee_mode": "bounded",
+                    "ai_edge_policy": "always",
+                },
+                "state_access": {"default_enabled": False},
+                "nodes": nodes,
+            }
+
         return {
             "id": graph_id,
             "name": graph_name,
@@ -188,6 +337,7 @@ class GraphBuilderAnton:
                 {
                     "node_id": "start",
                     "type": "start",
+                    "output_schema": {"type": "any"},
                     "next": "run_primary_tool",
                 },
                 {
@@ -195,6 +345,8 @@ class GraphBuilderAnton:
                     "type": "tool",
                     "tool": tool_name,
                     "args": {"query": summary},
+                    "input_schema": {"type": "any"},
+                    "output_schema": {"type": "any"},
                     "timeout_seconds": 45,
                     "max_retries": 2,
                     "idempotency_key": f"{graph_id}:run_primary_tool",
@@ -203,6 +355,7 @@ class GraphBuilderAnton:
                 {
                     "node_id": "end",
                     "type": "end",
+                    "input_schema": {"type": "any"},
                 },
             ],
         }
@@ -211,5 +364,49 @@ class GraphBuilderAnton:
         collapsed = " ".join(intent.strip().split())
         if not collapsed:
             return "untitled_graph"
-        words = collapsed[:64]
-        return words.replace(" ", "_").lower()
+        words = collapsed[:64].lower().replace(" ", "_")
+        words = re.sub(r"[^a-z0-9_]+", "", words)
+        return words or "untitled_graph"
+
+    def _message_content_to_text(self, content: object) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                    continue
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "\n".join(part for part in parts if part)
+        return str(content)
+
+    def _pick_tool(self, available_tools: list[str], preferred: list[str]) -> str | None:
+        if not available_tools:
+            return None
+        available_set = set(available_tools)
+        for candidate in preferred:
+            if candidate in available_set:
+                return candidate
+            for tool_name in available_tools:
+                if tool_name.endswith(f"_{candidate}"):
+                    return tool_name
+        return None
+
+    def _extract_markdown_path(self, intent: str) -> str | None:
+        match = re.search(r"([./~A-Za-z0-9_\-{}]+\.md)\b", intent)
+        if not match:
+            return None
+        return match.group(1)
+
+    def _normalize_output_path(self, output_path: str) -> str:
+        normalized = output_path.strip()
+        if not normalized:
+            return "./reports/automation_summary.md"
+        normalized = normalized.replace("{{date}}", "today")
+        normalized = normalized.replace("{{ current_date }}", "today")
+        normalized = normalized.replace("{{current_date}}", "today")
+        return normalized

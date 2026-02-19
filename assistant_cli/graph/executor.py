@@ -12,6 +12,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 
 from assistant_cli.graph.compiler import CompileOptions, CompiledGraph, GraphCompiler, render_diagnostics
+from assistant_cli.graph.contracts import validate_payload_against_schema
 from assistant_cli.graph.error_handler import ErrorHandlerAnton
 from assistant_cli.graph.hooks import GraphHookRegistry
 from assistant_cli.graph.schema import (
@@ -180,6 +181,11 @@ class GraphExecutor:
 
                 node_type = str(node["type"])
                 node_input = self._resolve_value(node.get("input", last_output), context)
+                self._validate_node_schema(
+                    node=node,
+                    payload=node_input,
+                    direction="input",
+                )
 
                 await self._emit_hook(
                     "before_node",
@@ -250,6 +256,11 @@ class GraphExecutor:
                 if node_type != "end" and next_node is None:
                     raise GraphExecutionError(f"Node '{current_node_id}' did not resolve a next node.")
 
+                self._validate_node_schema(
+                    node=node,
+                    payload=output,
+                    direction="output",
+                )
                 context[current_node_id] = output
                 context["last"] = output
                 last_output = output
@@ -817,6 +828,35 @@ class GraphExecutor:
         if violations:
             rendered = "\n".join(f"- {item}" for item in violations)
             raise GraphExecutionError(f"Guarantee mode policy violation:\n{rendered}")
+
+    def _validate_node_schema(
+        self,
+        *,
+        node: dict[str, Any],
+        payload: object,
+        direction: str,
+    ) -> None:
+        node_type = str(node.get("type") or "")
+        if direction == "input" and node_type == "start":
+            return
+        if direction == "output" and node_type == "end":
+            return
+
+        schema_key = "input_schema" if direction == "input" else "output_schema"
+        schema = node.get(schema_key)
+        if not isinstance(schema, dict):
+            return
+
+        errors = validate_payload_against_schema(
+            payload=payload,
+            schema=schema,
+            path="$",
+        )
+        if errors:
+            sample = "; ".join(errors[:3])
+            raise GraphExecutionError(
+                f"Node '{node.get('node_id')}' {direction} payload violates {schema_key}: {sample}"
+            )
 
     def _first_next(self, node: dict[str, Any], allow_missing: bool = False) -> str | None:
         raw_next = node.get("next")

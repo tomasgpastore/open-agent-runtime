@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -8,9 +9,25 @@ from assistant_cli.graph import GraphExecutionError, GraphExecutor, validate_gra
 from assistant_cli.graph.state_store import GraphStateStore
 
 
+def with_contracts(graph: dict) -> dict:
+    cloned = copy.deepcopy(graph)
+    nodes = cloned.get("nodes")
+    if not isinstance(nodes, list):
+        return cloned
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        node_type = str(node.get("type") or "")
+        if node_type != "start":
+            node.setdefault("input_schema", {"type": "any"})
+        if node_type != "end":
+            node.setdefault("output_schema", {"type": "any"})
+    return cloned
+
+
 class GraphSchemaTests(unittest.TestCase):
     def test_state_nodes_require_explicit_state_access(self) -> None:
-        graph = {
+        graph = with_contracts({
             "id": "g1",
             "name": "missing_state_access",
             "start": "start",
@@ -19,12 +36,12 @@ class GraphSchemaTests(unittest.TestCase):
                 {"node_id": "write", "type": "write_state", "key": "k", "value": 1, "next": "end"},
                 {"node_id": "end", "type": "end"},
             ],
-        }
+        })
         errors = validate_graph_definition(graph)
         self.assertTrue(any("requires state access" in err for err in errors))
 
     def test_valid_graph_with_state_nodes(self) -> None:
-        graph = {
+        graph = with_contracts({
             "id": "g2",
             "name": "valid_state_graph",
             "start": "start",
@@ -46,7 +63,7 @@ class GraphSchemaTests(unittest.TestCase):
                 },
                 {"node_id": "end", "type": "end"},
             ],
-        }
+        })
         self.assertEqual(validate_graph_definition(graph), [])
 
 
@@ -56,7 +73,7 @@ class GraphExecutionTests(unittest.TestCase):
             store = GraphStateStore(db_path=Path(tmp_dir) / "graph.db")
             executor = GraphExecutor(state_store=store)
 
-            graph = {
+            graph = with_contracts({
                 "id": "state_graph",
                 "name": "state_graph",
                 "start": "start",
@@ -78,7 +95,7 @@ class GraphExecutionTests(unittest.TestCase):
                     },
                     {"node_id": "end", "type": "end"},
                 ],
-            }
+            })
 
             result = executor.run(graph=graph, input_payload={"user": "tomas"}, guarantee_mode="bounded")
             self.assertEqual(result.status, "succeeded")
@@ -90,7 +107,7 @@ class GraphExecutionTests(unittest.TestCase):
             store = GraphStateStore(db_path=Path(tmp_dir) / "graph.db")
             executor = GraphExecutor(state_store=store)
 
-            graph = {
+            graph = with_contracts({
                 "id": "cond_graph",
                 "name": "typed_cond",
                 "start": "start",
@@ -109,7 +126,7 @@ class GraphExecutionTests(unittest.TestCase):
                     {"node_id": "fast_end", "type": "end"},
                     {"node_id": "slow_end", "type": "end"},
                 ],
-            }
+            })
 
             result = executor.run(graph=graph, input_payload={"mode": "fast"}, guarantee_mode="strict")
             self.assertEqual(result.status, "succeeded")
@@ -120,7 +137,7 @@ class GraphExecutionTests(unittest.TestCase):
             store = GraphStateStore(db_path=Path(tmp_dir) / "graph.db")
             executor = GraphExecutor(state_store=store)
 
-            graph = {
+            graph = with_contracts({
                 "id": "tool_graph",
                 "name": "tool_graph",
                 "start": "start",
@@ -134,7 +151,7 @@ class GraphExecutionTests(unittest.TestCase):
                     },
                     {"node_id": "end", "type": "end"},
                 ],
-            }
+            })
 
             with self.assertRaises(GraphExecutionError):
                 executor.run(graph=graph, input_payload={}, guarantee_mode="strict")
@@ -144,7 +161,7 @@ class GraphExecutionTests(unittest.TestCase):
             store = GraphStateStore(db_path=Path(tmp_dir) / "graph.db")
             executor = GraphExecutor(state_store=store)
 
-            graph = {
+            graph = with_contracts({
                 "id": "persist_graph",
                 "name": "persist_graph",
                 "start": "start",
@@ -160,7 +177,7 @@ class GraphExecutionTests(unittest.TestCase):
                     },
                     {"node_id": "end", "type": "end"},
                 ],
-            }
+            })
 
             executor.run(graph=graph, input_payload={"value": 42}, guarantee_mode="bounded")
             runs = store.read_prior_runs("persist_graph", limit=10)
