@@ -14,7 +14,9 @@ from assistant_cli.graph.compiler.passes import (
     run_canonicalize_pass,
     run_cfg_pass,
     run_defaults_pass,
+    run_edge_contract_pass,
     run_finalize_pass,
+    run_io_contract_pass,
     run_policy_pass,
     run_schema_pass,
     run_template_pass,
@@ -26,7 +28,7 @@ from assistant_cli.graph.schema import ALLOWED_GUARANTEE_MODES
 class GraphCompiler:
     """Deterministic graph compiler that normalizes and validates executable graphs."""
 
-    VERSION = "0.1.0"
+    VERSION = "0.2.0"
 
     def compile(
         self,
@@ -55,10 +57,18 @@ class GraphCompiler:
         diagnostics.extend(canonical_diags)
 
         if opts.inject_defaults:
-            rewritten, default_diags = run_defaults_pass(rewritten, opts.mode)
+            rewritten, default_diags = run_defaults_pass(
+                rewritten,
+                opts.mode,
+                opts.ai_edge_policy,
+            )
             diagnostics.extend(default_diags)
 
         diagnostics.extend(run_schema_pass(rewritten))
+        diagnostics.extend(run_io_contract_pass(rewritten))
+
+        rewritten, edge_diags = run_edge_contract_pass(rewritten)
+        diagnostics.extend(edge_diags)
 
         cfg_analysis, cfg_diags = run_cfg_pass(rewritten)
         diagnostics.extend(cfg_diags)

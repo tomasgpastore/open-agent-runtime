@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 
 CompileTargetMode = Literal["strict", "bounded", "flex"]
+AiEdgePolicy = Literal["always", "auto", "never"]
 DiagnosticSeverity = Literal["error", "warning", "info"]
 
 
@@ -23,6 +24,7 @@ class CompileOptions:
     mode: CompileTargetMode = "bounded"
     inject_defaults: bool = True
     allow_auto_rewrites: bool = True
+    ai_edge_policy: AiEdgePolicy | None = None
 
 
 @dataclass(slots=True)
@@ -46,7 +48,7 @@ class CompiledGraph:
     topology: list[str]
     compile_hash: str
     warnings: list[CompileDiagnostic] = field(default_factory=list)
-    compiler_version: str = "0.1.0"
+    compiler_version: str = "0.2.0"
 
 
 @dataclass(slots=True)

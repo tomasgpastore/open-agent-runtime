@@ -162,6 +162,8 @@ def _tool_schema_fields(tool: BaseTool) -> tuple[dict[str, dict[str, Any]], set[
     return props, required
 
 
+
+
 def _schema_accepts_type(schema: dict[str, Any], expected_type: str) -> bool:
     type_field = schema.get("type")
     if isinstance(type_field, str) and type_field == expected_type:

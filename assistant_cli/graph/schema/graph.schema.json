@@ -11,7 +11,8 @@
     "execution_defaults": {
       "type": "object",
       "properties": {
-        "guarantee_mode": {"type": "string", "enum": ["strict", "bounded", "flex"]}
+        "guarantee_mode": {"type": "string", "enum": ["strict", "bounded", "flex"]},
+        "ai_edge_policy": {"type": "string", "enum": ["always", "auto", "never"]}
       },
       "additionalProperties": true
     },
@@ -43,6 +44,12 @@
               "write_state",
               "read_prior_runs"
             ]
+          },
+          "input_schema": {
+            "type": "object"
+          },
+          "output_schema": {
+            "type": "object"
           },
           "next": {
             "oneOf": [

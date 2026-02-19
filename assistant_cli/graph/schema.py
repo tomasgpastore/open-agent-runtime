@@ -4,8 +4,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+from assistant_cli.graph.contracts import validate_contract_schema
+
 
 ALLOWED_GUARANTEE_MODES = {"strict", "bounded", "flex"}
+ALLOWED_AI_EDGE_POLICIES = {"always", "auto", "never"}
 ALLOWED_NODE_TYPES = {
     "start",
     "end",
@@ -55,6 +58,15 @@ def validate_graph_definition(graph: dict[str, Any]) -> list[str]:
         errors.append(
             "execution_defaults.guarantee_mode must be one of: strict, bounded, flex."
         )
+    ai_edge_policy = (
+        (graph.get("execution_defaults") or {}).get("ai_edge_policy")
+        if isinstance(graph.get("execution_defaults"), dict)
+        else None
+    )
+    if ai_edge_policy is not None and ai_edge_policy not in ALLOWED_AI_EDGE_POLICIES:
+        errors.append(
+            "execution_defaults.ai_edge_policy must be one of: always, auto, never."
+        )
 
     nodes = graph.get("nodes")
     if not isinstance(nodes, list) or not nodes:
@@ -87,6 +99,8 @@ def validate_graph_definition(graph: dict[str, Any]) -> list[str]:
 
         node_ids.add(node_id)
         node_map[node_id] = node
+
+        _validate_node_contracts(node=node, errors=errors, index=index)
 
         if node_type == "condition":
             strategy = node.get("strategy")
@@ -181,3 +195,40 @@ def _state_access_enabled(graph: dict[str, Any], node: dict[str, Any]) -> bool:
     if "state_access_enabled" in node:
         return bool(node.get("state_access_enabled"))
     return graph_default
+
+
+def _validate_node_contracts(*, node: dict[str, Any], errors: list[str], index: int) -> None:
+    node_id = str(node.get("node_id"))
+    node_type = str(node.get("type"))
+
+    if _requires_input_schema(node_type):
+        input_schema = node.get("input_schema")
+        if not isinstance(input_schema, dict):
+            errors.append(f"nodes[{index}] '{node_id}' requires object field 'input_schema'.")
+        else:
+            errors.extend(
+                validate_contract_schema(
+                    input_schema,
+                    path=f"nodes[{index}].input_schema",
+                )
+            )
+
+    if _requires_output_schema(node_type):
+        output_schema = node.get("output_schema")
+        if not isinstance(output_schema, dict):
+            errors.append(f"nodes[{index}] '{node_id}' requires object field 'output_schema'.")
+        else:
+            errors.extend(
+                validate_contract_schema(
+                    output_schema,
+                    path=f"nodes[{index}].output_schema",
+                )
+            )
+
+
+def _requires_input_schema(node_type: str) -> bool:
+    return node_type != "start"
+
+
+def _requires_output_schema(node_type: str) -> bool:
+    return node_type != "end"
